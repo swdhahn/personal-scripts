@@ -1,0 +1,5 @@
+// This is the default configuration file
+// make sure to rename this to .config if you're using it!
+default_project_path=~/Programming
+
+
