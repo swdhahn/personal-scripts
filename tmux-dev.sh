@@ -1,11 +1,12 @@
 #!/bin/sh
 
-CONFIG_FILE=.config
+CONFIG_FILE="/.config"
 
 default_project_path=""
+script_path="$(dirname "$BASH_SOURCE")"
 
 IFS=$'\n' # this sets the Internel Field Separator to \n
-for LINE in $(cat "$CONFIG_FILE")
+for LINE in $(cat "$script_path$CONFIG_FILE")
 do
 	if [[ $LINE == //* ]];
 	then
@@ -18,6 +19,11 @@ do
 	fi
 done
 echo "Default path loaded: $default_project_path"
+
+if [[ $1 == ig ]];
+then
+	default_project_path="/"
+fi
 
 dir=$(eval cd "$default_project_path" && find -type d | fzf)
 eval dir="$default_project_path${dir:1}"
