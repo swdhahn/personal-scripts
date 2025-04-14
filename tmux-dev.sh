@@ -25,7 +25,7 @@ then
 	default_project_path="/"
 fi
 
-dir=$(eval cd "$default_project_path" && find -type d | fzf)
+dir=$(eval cd "$default_project_path" && find . -type d | fzf)
 eval dir="$default_project_path${dir:1}"
 echo "Final project path: $dir"
 
