@@ -25,12 +25,19 @@ then
 	default_project_path="/"
 fi
 
-dir=$(eval cd "$default_project_path" && find -type d | fzf)
-eval dir="$default_project_path${dir:1}"
+
+dir=$(eval cd "$default_project_path" && find -type d 2>/dev/null | fzf)
+
+eval dir="$default_project_path${dir:1}/"
+echo "Opening dir: $dir"
+read -p "New dir?: $dir" n_mkdir
+dir="$dir$n_mkdir"
+mkdir -p $dir
 echo "Final project path: $dir"
 
 
-tmux new-session \; send-keys 'cd '$dir" && clear" C-m \; send-keys 'nvim .' C-m \; split-window -h \; send-keys 'cd '$dir" && clear" C-m \; resize-pane -R 25 \; split-window -v \; send-keys 'cd '$dir" && clear" C-m \; resize-pane -D 8 \; select-pane -t 0 \;
+cd $dir
+tmux new-session \; send-keys 'cd '$dir" && clear" C-m \; send-keys 'nvim .' C-m \; split-window -h \; send-keys 'cd '$dir" && clear && claude" C-m \; resize-pane -R 25 \; split-window -v \; send-keys 'cd '$dir" && clear" C-m \; resize-pane -D 8 \; select-pane -t 0 \;
  
 
 
