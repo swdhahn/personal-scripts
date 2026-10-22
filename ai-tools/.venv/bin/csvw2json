@@ -1,0 +1,6 @@
+#!/home/swdhahn/Programming/scripts/ai-tools/.venv/bin/python
+import sys
+from csvw.__main__ import csvw2json
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(csvw2json())
