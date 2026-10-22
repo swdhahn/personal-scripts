@@ -33,6 +33,7 @@ echo "Opening dir: $dir"
 read -p "New dir?: $dir" n_mkdir
 dir="$dir$n_mkdir"
 mkdir -p $dir
+
 echo "Final project path: $dir"
 
 
