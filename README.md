@@ -139,6 +139,7 @@ The same script runs on Windows 10/11. The pieces map like this:
 |---|---|
 | waybar `custom/ai` module | tray icon (`--tray`). Left click toggles AI Mode; the menu has chat, capture, session manager, sync, and daemon start/stop. Its colour follows the phase (aqua on, orange starting, red error, grey off/no daemon) and the tooltip shows the waybar text |
 | `$mod+a`-style Sway binds | global hotkeys registered by the tray (`hotkey_*` in `.config`) |
+| sway window borders | a thin Kanagawa client-side title bar in place of the white native one |
 | `gtk-layer-shell` overlay bar | an always-on-top popup, centred above the taskbar, that never takes focus |
 | `slurp` + `grim` + `wl-copy` | a full-screen drag-to-select overlay (Esc or right-click cancels). The capture is copied to the clipboard too |
 | `pw-play` | `winsound` (stdlib) |
@@ -151,9 +152,10 @@ Setup:
 
 1. Install Python 3.10+ from python.org. The Microsoft Store stub won't work.
 2. Install a GTK 3 runtime with PyGObject. The simplest route is a [gvsbuild](https://github.com/wingtk/gvsbuild) GTK 3 release: unzip it to `C:\gtk`, then `pip install` the `PyGObject` and `pycairo` wheels from its `wheels` folder into the same Python. The script finds `C:\gtk\bin` (or `C:\gtk-build\gtk\x64\release\bin`) on its own; set `AI_ASSISTANT_GTK_BIN` if yours is elsewhere.
-3. Put `llama-server.exe` on `PATH` (or use a full path in `llama_server_cmd`). Backslashes in config commands are fine, and paths with spaces need quotes.
-4. Run it once from a terminal so you can watch the `.venv` bootstrap: `python ai-tools\ai_assistant.py --tray`. On Windows it also installs `pystray` and `pillow`. `kokoro-onnx` / `soundfile` are attempted once; if they can't install, narration stays silent and nothing else breaks.
-5. Optional: start at login with `powershell -ExecutionPolicy Bypass -File ai-tools\windows\install-startup.ps1` (`-Remove` undoes it).
+3. Install [JetBrainsMono Nerd Font](https://github.com/ryanoasis/nerd-fonts/releases) (the `JetBrainsMono` archive). The UI's icons and title-bar buttons are Nerd Font glyphs and show as blank boxes without it.
+4. Put `llama-server.exe` on `PATH` (or use a full path in `llama_server_cmd`). Backslashes in config commands are fine, and paths with spaces need quotes.
+5. Run it once from a terminal so you can watch the `.venv` bootstrap: `python ai-tools\ai_assistant.py --tray`. On Windows it also installs `pystray` and `pillow`. `kokoro-onnx` / `soundfile` are attempted once; if they can't install, narration stays silent and nothing else breaks.
+6. Optional: start at login with `powershell -ExecutionPolicy Bypass -File ai-tools\windows\install-startup.ps1` (`-Remove` undoes it).
 
 The daemon's output goes to `%LOCALAPPDATA%\ai_assistant\logs\daemon.log` when the tray starts it. ODT targets may be local Windows paths (`C:\Notes\x.odt`, `file:///C:/Notes/x.odt`) as well as Nextcloud paths.
 

@@ -601,6 +601,40 @@ combobox window.popup, combobox window.popup list {{ background-color: {surface}
 .md-td {{ color: {fg_float}; }}
 .md-rule {{ background-color: {border}; min-height: 1px; }}
 
+/* ---- thin client-side title bar (Windows/macOS; Linux keeps sway's) ----
+   :backdrop is listed too, or Adwaita repaints the unfocused bar light grey. */
+window.themed-chrome.csd decoration {{ border-radius: 0; }}
+headerbar.thin-titlebar, headerbar.thin-titlebar:backdrop {{
+    min-height: 0;
+    padding: 0 0 0 10px;
+    margin: 0;
+    background-image: none;
+    background-color: {bg_dim};
+    border: none;
+    border-bottom: 1px solid {surface};
+    border-radius: 0;
+    box-shadow: none;
+}}
+headerbar.thin-titlebar label.thin-title {{ color: {fg_dim}; font-size: 11px; }}
+headerbar.thin-titlebar:backdrop label.thin-title {{ color: {nontext}; }}
+headerbar.thin-titlebar button.win-btn,
+headerbar.thin-titlebar button.win-btn:backdrop {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    min-height: 0;
+    min-width: 0;
+    padding: 4px 13px;
+    margin: 0;
+}}
+headerbar.thin-titlebar button.win-btn label {{ color: {fg_dim}; font-size: 11px; }}
+headerbar.thin-titlebar button.win-btn:hover {{ background-color: {raised}; }}
+headerbar.thin-titlebar button.win-btn:hover label {{ color: {fg}; }}
+headerbar.thin-titlebar button.win-close:hover {{ background-color: {error}; }}
+headerbar.thin-titlebar button.win-close:hover label {{ color: {bg}; }}
+
 .chat-meta   {{ color: {nontext}; font-size: 11px; }}
 .chat-error  {{ color: {error}; }}
 .memory-chip {{ color: {ok}; font-size: 11px; }}
@@ -634,6 +668,62 @@ def style(widget, *classes):
     for name in classes:
         ctx.add_class(name)
     return widget
+
+
+# Nerd Font codicons (chrome_*), drawn like the native Windows caption buttons.
+ICON_WIN_MIN = ""
+ICON_WIN_MAX = ""
+ICON_WIN_RESTORE = ""
+ICON_WIN_CLOSE = ""
+
+
+def themed_titlebar(window, dialog=False):
+    """Swap the native title bar for a thin Kanagawa one (Windows/macOS).
+
+    The native Windows caption is white and cannot be styled from GTK, so a
+    client-side HeaderBar replaces it. Linux keeps server-side decorations:
+    sway draws its own, and a client-side bar there would add a second title.
+    Dialogs get only a close button.
+    """
+    if platform_support.IS_LINUX:
+        return
+    saved_title = window.get_title() or ""
+    style(window, "themed-chrome")
+    bar = style(Gtk.HeaderBar(), "thin-titlebar")
+    bar.set_show_close_button(False)
+    bar.set_property("spacing", 0)
+
+    title = style(Gtk.Label(label=window.get_title() or ""), "thin-title")
+    title.set_ellipsize(Pango.EllipsizeMode.END)
+    bar.set_custom_title(title)
+    window.connect("notify::title", lambda w, _: title.set_text(w.get_title() or ""))
+
+    def caption_button(glyph, handler, *css):
+        button = style(Gtk.Button(label=glyph), "win-btn", *css)
+        button.set_can_focus(False)
+        button.connect("clicked", handler)
+        return button
+
+    # pack_end fills right-to-left: close sits in the corner.
+    bar.pack_end(caption_button(ICON_WIN_CLOSE, lambda _: window.close(), "win-close"))
+    if not dialog:
+        def toggle_maximize(_):
+            window.unmaximize() if window.is_maximized() else window.maximize()
+
+        maximize = caption_button(ICON_WIN_MAX, toggle_maximize)
+        bar.pack_end(maximize)
+        bar.pack_end(caption_button(ICON_WIN_MIN, lambda _: window.iconify()))
+
+        def on_state(_, event):
+            maximized = bool(event.new_window_state & Gdk.WindowState.MAXIMIZED)
+            maximize.set_label(ICON_WIN_RESTORE if maximized else ICON_WIN_MAX)
+        window.connect("window-state-event", on_state)
+
+    bar.show_all()
+    window.set_titlebar(bar)
+    # set_titlebar() clears the title on win32, which leaves the taskbar entry
+    # and Alt+Tab blank; restoring it also refills the label above.
+    window.set_title(saved_title)
 
 
 # ==============================================================================
@@ -2288,6 +2378,7 @@ class SessionPopup(Gtk.Window):
     def __init__(self, sock_path, current_session=None, unsynced_count=0):
         super().__init__(title="AI Assistant Session")
         install_theme()
+        themed_titlebar(self)
         self.sock_path = sock_path
         self.set_wmclass("ai-assistant-popup", "ai-assistant-popup")
         self.set_default_size(540, 390)
@@ -2431,6 +2522,7 @@ class MemoryDialog(Gtk.Dialog):
     def __init__(self, parent, item):
         super().__init__(title="Memory", transient_for=parent, modal=True)
         install_theme()
+        themed_titlebar(self, dialog=True)
         self.set_default_size(560, 400)
         self.item = item
         style(self, "themed-dialog")
@@ -2512,6 +2604,7 @@ class ChatPopup(Gtk.Window):
     def __init__(self, config, sock_path, conversation_id=None):
         super().__init__(title="AI Assistant Chat")
         install_theme()
+        themed_titlebar(self)
         self.config = config
         self.sock_path = sock_path
         self.set_wmclass("ai-assistant-chat", "ai-assistant-chat")
@@ -3126,6 +3219,7 @@ class ChatPopup(Gtk.Window):
         )
         dialog.format_secondary_text(detail)
         style(dialog, "themed-dialog")
+        themed_titlebar(dialog, dialog=True)
         for pane in (dialog.get_content_area(), dialog.get_action_area()):
             if pane is not None:
                 style(pane, "themed-dialog")
@@ -3400,6 +3494,10 @@ class ChatPopup(Gtk.Window):
             timeout=300,
         )
         resp.raise_for_status()
+        # llama-server sends "text/event-stream" with no charset, so requests
+        # falls back to ISO-8859-1 and splits every multi-byte character
+        # ("It’s" renders as "Itâs"). SSE is UTF-8 by definition.
+        resp.encoding = "utf-8"
 
         parts, tool_acc = [], {}
         reasoning_chars, reasoning_mark = 0, 0
