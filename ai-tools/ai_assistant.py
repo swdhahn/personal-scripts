@@ -6,19 +6,62 @@ import subprocess
 import urllib.request
 import venv
 
+import platform_support
+
 # ==============================================================================
 # 1. SELF-BOOTSTRAPPING ENVIRONMENT & DEPENDENCY CHECK
 # ==============================================================================
+# Windows/macOS: kokoro-onnx and soundfile are best-effort (narration degrades
+# to silence without them); pystray + Pillow drive the tray and region capture.
+PORTABLE_REQUIRED = {"requests": "requests", "odfpy": "odf", "numpy": "numpy",
+                     "pygments": "pygments", "pystray": "pystray", "pillow": "PIL"}
+PORTABLE_OPTIONAL = {"kokoro-onnx": "kokoro_onnx", "soundfile": "soundfile"}
+
+
+def _bootstrap_portable(venv_python, venv_dir, script_dir):
+    quiet = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 **platform_support.no_window_kwargs())
+
+    def importable(modules):
+        return subprocess.call([venv_python, "-c", "import " + ", ".join(modules)], **quiet) == 0
+
+    gi_probe = (
+        f"import sys; sys.path.insert(0, {script_dir!r}); import platform_support as p; "
+        "p.prepare_gtk_dll_path(); import gi; gi.require_version('Gtk', '3.0'); "
+        "from gi.repository import Gtk"
+    )
+    if subprocess.call([venv_python, "-c", gi_probe], **quiet) != 0:
+        platform_support.notify(platform_support.gtk_install_hint())
+        sys.exit(1)
+
+    if not importable(PORTABLE_REQUIRED.values()):
+        print("[AI Assistant] Installing Python packages: " + ", ".join(PORTABLE_REQUIRED))
+        subprocess.check_call([venv_python, "-m", "pip", "install", "--upgrade", "pip"]
+                              + list(PORTABLE_REQUIRED))
+
+    # Try the optional set once per venv; retrying on every launch would make
+    # each popup wait on pip.
+    marker = os.path.join(venv_dir, ".optional_attempted")
+    if not os.path.exists(marker) and not importable(PORTABLE_OPTIONAL.values()):
+        print("[AI Assistant] Installing optional TTS packages: " + ", ".join(PORTABLE_OPTIONAL))
+        # kokoro-onnx caps itself at <3.14, but gvsbuild's PyGObject wheels are
+        # 3.14-only; its deps all ship 3.14 wheels, so the cap is ignored.
+        pip_cmd = [venv_python, "-m", "pip", "install", "--ignore-requires-python"]
+        if subprocess.call(pip_cmd + list(PORTABLE_OPTIONAL)) != 0:
+            print("[AI Assistant] TTS packages unavailable; narration will be silent.")
+        open(marker, "w").close()
+
+
 def bootstrap_env():
     """Ensures system dependencies, Python packages, and Kokoro TTS models exist."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     venv_dir = os.path.join(script_dir, ".venv")
-    venv_python = os.path.join(venv_dir, "bin", "python")
+    venv_python = platform_support.venv_python(venv_dir)
 
     if os.path.abspath(sys.prefix) != os.path.abspath(venv_dir):
         if not os.path.exists(venv_python):
             missing_bins = [cmd for cmd in ("grim", "slurp", "wl-copy", "espeak-ng") if not shutil.which(cmd)]
-            if missing_bins and sys.stdin.isatty():
+            if platform_support.IS_LINUX and shutil.which("pacman") and missing_bins and sys.stdin and sys.stdin.isatty():
                 print(f"[AI Assistant] Missing system packages: {', '.join(missing_bins)}")
                 print("[AI Assistant] Installing required system packages via pacman...")
                 subprocess.run([
@@ -34,15 +77,24 @@ def bootstrap_env():
         # for it and go straight to the exec so the bar stays responsive.
         fast_path = any(a in ("--waybar", "--ai-toggle", "--ai-on", "--ai-off") for a in sys.argv[1:])
 
-        # Ensure all required pip packages (including kokoro-onnx) are present
-        check_cmd = [venv_python, "-c", "import requests, odf, kokoro_onnx, soundfile, numpy, pygments"]
-        if not fast_path and subprocess.call(check_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
-            print("[AI Assistant] Installing Python packages (requests, odfpy, kokoro-onnx, soundfile, numpy, pygments)...")
-            subprocess.check_call([
-                venv_python, "-m", "pip", "install", "--upgrade",
-                "pip", "requests", "odfpy", "kokoro-onnx", "soundfile", "numpy", "pygments"
-            ])
+        if not platform_support.IS_LINUX:
+            if not fast_path:
+                _bootstrap_portable(venv_python, venv_dir, script_dir)
+        else:
+            # Ensure all required pip packages (including kokoro-onnx) are present
+            check_cmd = [venv_python, "-c", "import requests, odf, kokoro_onnx, soundfile, numpy, pygments"]
+            if not fast_path and subprocess.call(check_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+                print("[AI Assistant] Installing Python packages (requests, odfpy, kokoro-onnx, soundfile, numpy, pygments)...")
+                subprocess.check_call([
+                    venv_python, "-m", "pip", "install", "--upgrade",
+                    "pip", "requests", "odfpy", "kokoro-onnx", "soundfile", "numpy", "pygments"
+                ])
 
+        if platform_support.IS_WINDOWS:
+            # Windows has no real exec: os.execv spawns and returns at once, so
+            # callers would see this process exit early. Wait and forward the code.
+            launch = platform_support.venv_python(venv_dir, windowless=platform_support.launched_windowless())
+            sys.exit(subprocess.call([launch, os.path.abspath(__file__)] + sys.argv[1:]))
         os.execv(venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:])
 
 bootstrap_env()
@@ -65,8 +117,14 @@ import threading
 import tempfile
 from datetime import datetime
 import requests
-import soundfile as sf
-from kokoro_onnx import Kokoro
+
+# TTS is optional off Linux (no onnxruntime wheel for every Windows Python);
+# narration fails soft inside _play_kokoro_tts when these are missing.
+try:
+    import soundfile as sf
+    from kokoro_onnx import Kokoro
+except ImportError:
+    sf = Kokoro = None
 
 from odf.opendocument import load, OpenDocumentText
 from odf.style import Style, TextProperties, ParagraphProperties
@@ -74,10 +132,19 @@ from odf.text import P, H, Span, List as OdfList, ListItem as OdfListItem
 
 import memory_db
 
+platform_support.prepare_gtk_dll_path()
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('GtkLayerShell', '0.1')
-from gi.repository import Gtk, Gdk, GLib, Pango, GtkLayerShell
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Pango
+
+# gtk-layer-shell is Wayland-only; elsewhere the overlay bar is a plain
+# always-on-top popup window.
+try:
+    gi.require_version('GtkLayerShell', '0.1')
+    from gi.repository import GtkLayerShell
+except (ValueError, ImportError):
+    GtkLayerShell = None
 
 # ==============================================================================
 # 3. CONFIGURATION PARSER (9x9x Port Standard)
@@ -89,6 +156,7 @@ def load_config():
     if not os.path.exists(cfg_path):
         cfg_path = os.path.abspath(os.path.join(script_dir, ".config"))
 
+    data_dir = platform_support.data_dir()
     config = {
         "default_project_path": os.path.expanduser("~/Programming"),
         "llama_url": "http://127.0.0.1:9090/v1/chat/completions",
@@ -98,25 +166,32 @@ def load_config():
         "tts_url": "http://127.0.0.1:9292/v1/audio/speech",
         "tts_voice": "am_michael",
         "tts_speed": "0.95",
-        "tts_model_dir": os.path.expanduser("~/.local/share/ai_assistant/tts"),
+        "tts_model_dir": os.path.join(data_dir, "tts"),
         "nextcloud_url": "https://your-nextcloud.domain.com",
         "nextcloud_user": "your_username",
         "nextcloud_token": "your_app_password_token",
-        "session_history_dir": os.path.expanduser("~/.local/share/ai_assistant/sessions"),
-        "socket_path": "/tmp/ai_assistant.sock",
+        "session_history_dir": os.path.join(data_dir, "sessions"),
+        "socket_path": platform_support.default_ipc_address(),
 
         # --- AI Mode: llama.cpp server lifecycle ---
         "llama_server_cmd": "",
         "llama_small_server_cmd": "",
         "llama_health_url": "http://127.0.0.1:9090/health",
         "llama_small_health_url": "http://127.0.0.1:9191/health",
-        "ai_mode_state_file": os.path.expanduser("~/.local/share/ai_assistant/ai_mode.json"),
+        "ai_mode_state_file": os.path.join(data_dir, "ai_mode.json"),
         "ai_mode_start_timeout": "180",
         "llama_context": "",
         "waybar_signal": "8",
 
+        # --- Tray icon (Windows/macOS stand-in for the waybar module) ---
+        "tray_start_daemon": "1",
+        "tray_poll_seconds": "3",
+        "hotkey_chat": "ctrl+alt+a",
+        "hotkey_capture": "ctrl+alt+s",
+        "hotkey_ai_toggle": "ctrl+alt+shift+a",
+
         # --- Chat memory ---
-        "memory_db_path": os.path.expanduser("~/.local/share/ai_assistant/memory.db"),
+        "memory_db_path": os.path.join(data_dir, "memory.db"),
         "memory_top_k": "6",
         "memory_recency_half_life_days": "30",
         "memory_min_importance": "0.25",
@@ -124,7 +199,7 @@ def load_config():
         "memory_summarize_after": "20",
         "chat_system_prompt": (
             "You are a concise, technically fluent desktop assistant running locally on the "
-            "user's Linux machine. You have a persistent memory of past conversations: relevant "
+            f"user's {platform_support.OS_NAME} machine. You have a persistent memory of past conversations: relevant "
             "entries are supplied to you automatically, and you can call the memory_search tool "
             "to look up anything else you have been told before. Never invent a memory -- if you "
             "do not know something, search for it or say you do not know. Format with Markdown."
@@ -132,7 +207,8 @@ def load_config():
     }
 
     if os.path.exists(cfg_path):
-        with open(cfg_path, "r") as f:
+        # utf-8-sig: tolerate the BOM Notepad writes on Windows.
+        with open(cfg_path, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("--") or line.startswith("//"):
@@ -152,7 +228,7 @@ def config_argv(config, key):
     if not raw:
         return []
     try:
-        return [os.path.expanduser(tok) for tok in shlex.split(raw)]
+        return [os.path.expanduser(tok) for tok in platform_support.split_command(raw)]
     except ValueError as e:
         print(f"[AI Assistant] Malformed command in config key {key!r}: {e}", file=sys.stderr)
         return []
@@ -998,17 +1074,40 @@ def repair_json(fragment, cuts):
 # ==============================================================================
 # 5. DAEMON: STATUS BAR & SERVER
 # ==============================================================================
+def _layer_shell_usable():
+    if GtkLayerShell is None:
+        return False
+    is_supported = getattr(GtkLayerShell, "is_supported", None)
+    return is_supported() if is_supported else True
+
+
 class BottomStatusBar(Gtk.Window):
+    MARGIN = 16
+
     def __init__(self):
-        super().__init__(type=Gtk.WindowType.TOPLEVEL)
-        GtkLayerShell.init_for_window(self)
-        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
-        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
-        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, 16)
-        GtkLayerShell.set_keyboard_interactivity(self, False)
+        self.layer_shell = _layer_shell_usable()
+        super().__init__(type=Gtk.WindowType.TOPLEVEL if self.layer_shell else Gtk.WindowType.POPUP)
+        if self.layer_shell:
+            GtkLayerShell.init_for_window(self)
+            GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
+            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, self.MARGIN)
+            GtkLayerShell.set_keyboard_interactivity(self, False)
+            self.set_app_paintable(True)
+        else:
+            # Windows / macOS / X11: an unfocusable topmost popup that we
+            # centre above the taskbar ourselves on every update.
+            self.set_keep_above(True)
+            self.set_accept_focus(False)
+            self.set_skip_taskbar_hint(True)
+            self.set_skip_pager_hint(True)
+            screen = self.get_screen()
+            visual = screen.get_rgba_visual() if screen else None
+            if visual is not None and screen.is_composited():
+                self.set_visual(visual)
+                self.set_app_paintable(True)
 
         self.set_decorated(False)
-        self.set_app_paintable(True)
 
         install_theme()
         style(self, "status-bar")
@@ -1034,9 +1133,24 @@ class BottomStatusBar(Gtk.Window):
 
         self.label.set_text(text)
         self.show_all()
+        if not self.layer_shell:
+            self._place_bottom_center()
         if timeout > 0:
             self.hide_timer = GLib.timeout_add_seconds(timeout, self._hide_bar)
         return False
+
+    def _place_bottom_center(self):
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        if monitor is None:
+            return
+        area = monitor.get_workarea()             # excludes the taskbar / dock
+        natural = self.get_preferred_size()[1]
+        self.resize(natural.width, natural.height)  # shrink when the text does
+        self.move(area.x + (area.width - natural.width) // 2,
+                  area.y + area.height - natural.height - self.MARGIN)
 
     def _hide_bar(self):
         self.hide()
@@ -1063,6 +1177,9 @@ class AssistantDaemon:
         self._health_checked = 0.0
         self.servers = {}            # name -> Popen we own
         self.ai_lock = threading.RLock()
+        # Held while old servers are being killed, so a quick off->on toggle
+        # cannot launch new ones while the old still hold the port and memory.
+        self.reap_lock = threading.Lock()
         self.state_file = self.config["ai_mode_state_file"]
         self.log_dir = os.path.join(os.path.dirname(self.state_file), "logs")
 
@@ -1094,8 +1211,10 @@ class AssistantDaemon:
         """Auto-downloads Kokoro ONNX files on first use and initializes the local CPU TTS engine."""
         if self.kokoro_engine is not None:
             return self.kokoro_engine
+        if Kokoro is None or sf is None:
+            raise RuntimeError("kokoro-onnx / soundfile are not installed in the venv")
 
-        tts_dir = self.config.get("tts_model_dir", os.path.expanduser("~/.local/share/ai_assistant/tts"))
+        tts_dir = self.config.get("tts_model_dir", os.path.join(platform_support.data_dir(), "tts"))
         os.makedirs(tts_dir, exist_ok=True)
 
         model_path = os.path.join(tts_dir, "kokoro-v1.0.int8.onnx")
@@ -1215,7 +1334,7 @@ class AssistantDaemon:
         found we raise instead of silently falling through to the built-in voice list
         (which produced the misleading "Voice ./x.npy not found in available voices").
         """
-        tts_dir = self.config.get("tts_model_dir", os.path.expanduser("~/.local/share/ai_assistant/tts"))
+        tts_dir = self.config.get("tts_model_dir", os.path.join(platform_support.data_dir(), "tts"))
         script_dir = os.path.dirname(os.path.abspath(__file__))
         raw = os.path.expanduser(voice_cfg.strip())
         looks_like_file = raw.endswith(".npy")
@@ -1277,6 +1396,9 @@ class AssistantDaemon:
                     timeout=2
                 )
                 if r.status_code == 200:
+                    if not platform_support.IS_LINUX:
+                        platform_support.play_wav(r.content)
+                        return
                     p = subprocess.Popen(["pw-play", "-"], stdin=subprocess.PIPE)
                     for chunk in r.iter_content(chunk_size=4096):
                         if chunk:
@@ -1310,6 +1432,9 @@ class AssistantDaemon:
             sf.write(wav_buf, samples, sample_rate, format="WAV")
             wav_buf.seek(0)
 
+            if not platform_support.IS_LINUX:
+                platform_support.play_wav(wav_buf.read())
+                return
             p = subprocess.Popen(["pw-play", "-"], stdin=subprocess.PIPE)
             p.communicate(input=wav_buf.read())
         except Exception as e:
@@ -1329,6 +1454,8 @@ class AssistantDaemon:
 
     def _ping_waybar(self):
         """Nudge waybar so the module repaints immediately instead of on its poll."""
+        if not platform_support.IS_LINUX:
+            return                    # the tray icon polls; there is no waybar
         sig = self.config.get("waybar_signal", "8")
         try:
             subprocess.run(["pkill", f"-RTMIN+{sig}", "waybar"],
@@ -1355,9 +1482,22 @@ class AssistantDaemon:
             print(f"Could not write AI mode state: {e}", file=sys.stderr)
         self._ping_waybar()
 
-    def _kill_pid(self, pid, label="server", grace=8.0):
+    def _server_images(self):
+        """Lowercase exe stems of the configured servers (Windows PID guard)."""
+        stems = set()
+        for _, cmd_key, _ in self.SERVER_SPECS:
+            argv = config_argv(self.config, cmd_key)
+            if argv:
+                stems.add(os.path.splitext(os.path.basename(argv[0]))[0].lower())
+        return stems
+
+    def _kill_pid(self, pid, label="server", grace=8.0, verify=False):
         """SIGTERM the process group, escalating to SIGKILL after `grace`."""
         if not pid:
+            return
+        if platform_support.IS_WINDOWS:
+            platform_support.win_kill_tree(
+                pid, label, grace, expect_images=self._server_images() if verify else None)
             return
         try:
             pgid = os.getpgid(pid)
@@ -1390,7 +1530,7 @@ class AssistantDaemon:
         except (OSError, ValueError):
             prev = {}
         for name, pid in (prev.get("pids") or {}).items():
-            self._kill_pid(pid, f"orphaned {name}")
+            self._kill_pid(pid, f"orphaned {name}", verify=True)
         self.ai_enabled, self.ai_phase, self.ai_error = False, "off", ""
         self._write_ai_state()
 
@@ -1431,6 +1571,12 @@ class AssistantDaemon:
         os.makedirs(self.log_dir, exist_ok=True)
         launched = []
 
+        if not self.reap_lock.acquire(blocking=False):
+            self.bar.show_message("AI Mode: waiting for previous servers to exit...",
+                                  timeout=0, level="warn")
+            self.reap_lock.acquire()
+        self.reap_lock.release()
+
         for name, cmd_key, health_key in self.SERVER_SPECS:
             health_url = self.config[health_key]
             if self._health_ok(health_url):
@@ -1443,7 +1589,7 @@ class AssistantDaemon:
                 logfile = open(os.path.join(self.log_dir, f"llama-{name}.log"), "ab", buffering=0)
                 proc = subprocess.Popen(
                     argv, stdout=logfile, stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL, start_new_session=True,
+                    stdin=subprocess.DEVNULL, **platform_support.detached_popen_kwargs(),
                 )
             except (OSError, ValueError) as e:
                 with self.ai_lock:
@@ -1500,7 +1646,8 @@ class AssistantDaemon:
         self.bar.show_message(f"AI Mode ON{note}", timeout=4, level="ok")
         self.announce_event("AI mode is now active. Both local language model servers are up.")
 
-    def ai_mode_off(self):
+    def ai_mode_off(self, wait=False):
+        """wait=True reaps the servers inline (daemon shutdown must not exit first)."""
         with self.ai_lock:
             was_on = self.ai_phase != "off"
             procs = list(self.servers.items())
@@ -1526,14 +1673,24 @@ class AssistantDaemon:
 
         # A 35B model can take several seconds to exit; reap off-thread so the
         # waybar click gets an immediate reply instead of a timeout.
+        # Taken here rather than in the reaper thread, so an immediate toggle
+        # back on is guaranteed to see the reap in progress.
         if procs:
+            self.reap_lock.acquire()
+        if procs and wait:
+            self._reap_servers(procs)
+        elif procs:
             threading.Thread(target=self._reap_servers, args=(procs,), daemon=True).start()
         return self.ai_mode_status()
 
     def _reap_servers(self, procs):
-        for name, proc in procs:
-            if proc and proc.poll() is None:
-                self._kill_pid(proc.pid, name)
+        """Kill `procs`; the caller already holds reap_lock, released here."""
+        try:
+            for name, proc in procs:
+                if proc and proc.poll() is None:
+                    self._kill_pid(proc.pid, name)
+        finally:
+            self.reap_lock.release()
         self._write_ai_state()
 
     def _refresh_health(self, max_age=4.0):
@@ -1712,6 +1869,9 @@ class AssistantDaemon:
             if not data:
                 return
             req = json.loads(data)
+            if not platform_support.ipc_authorized(self.sock_path, req):
+                conn.sendall(json.dumps({"error": "unauthorized"}).encode("utf-8"))
+                return
             cmd = req.get("command")
 
             if cmd == "status":
@@ -1827,6 +1987,13 @@ class AssistantDaemon:
                 if msg:
                     self.announce_event(msg)
                 conn.sendall(json.dumps({"status": "ok"}).encode("utf-8"))
+
+            elif cmd == "shutdown":
+                # Tray "Quit": stop the servers we own before the loop exits,
+                # otherwise the daemon threads die with a 35B model still loaded.
+                self.ai_mode_off(wait=True)
+                conn.sendall(json.dumps({"status": "ok"}).encode("utf-8"))
+                GLib.idle_add(Gtk.main_quit)
 
         except Exception as e:
             print(f"Socket error: {e}", file=sys.stderr)
@@ -1966,11 +2133,9 @@ class AssistantDaemon:
         nc_user = self.config["nextcloud_user"]
         nc_token = self.config["nextcloud_token"]
 
-        is_remote = not (
-            doc_target.startswith("/") or doc_target.startswith("~") or doc_target.startswith("file://")
-        )
+        is_remote = not platform_support.is_local_path(doc_target)
         if not is_remote:
-            local_odt = os.path.expanduser(doc_target.replace("file://", ""))
+            local_odt = platform_support.local_path_from_target(doc_target)
             doc = load(local_odt) if os.path.exists(local_odt) else OpenDocumentText()
         else:
             local_odt = tempfile.NamedTemporaryFile(suffix=".odt", delete=False).name
@@ -1996,20 +2161,23 @@ class AssistantDaemon:
         doc.save(local_odt)
 
         if is_remote:
+            # Close the upload handle before removing: Windows refuses to delete
+            # an open file, which would mask the "Locked" error below.
             with open(local_odt, "rb") as f:
                 put_resp = requests.put(webdav_url, data=f, auth=(nc_user, nc_token))
-                if put_resp.status_code == 423:
-                    os.remove(local_odt)
-                    raise Exception("Document is open in Nextcloud (Locked).")
-                put_resp.raise_for_status()
             os.remove(local_odt)
+            if put_resp.status_code == 423:
+                raise Exception("Document is open in Nextcloud (Locked).")
+            put_resp.raise_for_status()
 
     def start_server(self):
-        if os.path.exists(self.sock_path):
-            os.remove(self.sock_path)
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(self.sock_path)
-        server.listen(5)
+        try:
+            server = platform_support.ipc_listen(self.sock_path)
+        except OSError as e:
+            # Most likely a second daemon already holds the TCP port.
+            print(f"[AI Assistant] Cannot listen on {self.sock_path}: {e}", file=sys.stderr)
+            GLib.idle_add(Gtk.main_quit)
+            return
         while True:
             conn, _ = server.accept()
             threading.Thread(target=self.handle_client, args=(conn,), daemon=True).start()
@@ -2018,52 +2186,34 @@ class AssistantDaemon:
 # 6. CLIENT: POPUPS, CHAT & MANUAL SYNC
 # ==============================================================================
 def notify(message, title="AI Assistant"):
-    """Desktop notification, degrading to stderr where notify-send is absent."""
-    if shutil.which("notify-send"):
-        try:
-            subprocess.run(["notify-send", title, message],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-        except OSError:
-            pass
-    print(f"[{title}] {message}", file=sys.stderr)
+    """Desktop notification, degrading to stderr where nothing is available."""
+    platform_support.notify(message, title)
 
 
 def send_cmd(sock_path, payload, quiet=False, timeout=15.0):
     """Round-trip one command to the daemon.
 
     quiet=True returns None instead of exiting, for callers that must never
-    fail loudly (the waybar module polls this every few seconds).
+    fail loudly (the waybar module and tray icon poll this every few seconds).
     """
-    if not os.path.exists(sock_path):
+    if not platform_support.ipc_maybe_running(sock_path):
         if quiet:
             return None
-        notify("Daemon not running! Start it or check dinitctl.")
+        notify(platform_support.daemon_not_running_hint())
         sys.exit(1)
 
-    client = None
     try:
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(timeout)
-        client.connect(sock_path)
-        client.sendall(json.dumps(payload).encode("utf-8"))
-        # Read to EOF; the daemon closes the connection after replying, and a
-        # single recv() would truncate larger payloads such as memory_stats.
-        chunks = []
-        while True:
-            chunk = client.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return json.loads(b"".join(chunks).decode("utf-8"))
+        return platform_support.ipc_request(sock_path, payload, timeout)
+    except ConnectionRefusedError:
+        if quiet:
+            return None
+        notify(platform_support.daemon_not_running_hint())
+        sys.exit(1)
     except (OSError, ValueError) as e:
         if quiet:
             return None
         notify(f"Daemon error: {e}")
         sys.exit(1)
-    finally:
-        if client is not None:
-            client.close()
 
 
 def clamp_title(raw, max_words=7, max_chars=52):
@@ -2408,9 +2558,11 @@ class ChatPopup(Gtk.Window):
             self._load_history()
         self._refresh_sidebar()
         if not self.ai_ready:
+            where = ("in waybar (or $mod+Shift+a)" if platform_support.IS_LINUX else
+                     f"from the tray icon (or {config.get('hotkey_ai_toggle', '')})")
             self._add_notice(
                 "AI Mode is off -- the model servers are not running. "
-                "Toggle AI Mode in waybar (or $mod+Shift+a) to start chatting.")
+                f"Toggle AI Mode {where} to start chatting.")
         GLib.idle_add(self._focus_input)
 
     def _db(self, fn, *args, **kwargs):
@@ -3507,15 +3659,170 @@ class ChatPopup(Gtk.Window):
         return False
 
 
+class RegionSelector(Gtk.Window):
+    """Drag-to-select overlay for platforms without slurp (Windows, X11).
+
+    The desktop is grabbed first at native resolution and painted scaled to
+    the window, so the selection maps back by ratio -- which also absorbs any
+    display scaling between GDK's logical pixels and the grab's physical ones.
+    Esc or right-click cancels.
+    """
+
+    def __init__(self, shot):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.shot = shot.convert("RGB")
+        self.result = None
+        self._start = self._end = None
+        self._scaled = None
+
+        w, h = self.shot.size
+        self._pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(
+            GLib.Bytes.new(self.shot.tobytes()), GdkPixbuf.Colorspace.RGB, False, 8, w, h, w * 3)
+
+        x, y, vw, vh = self._virtual_desktop()
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.move(x, y)
+        self.set_default_size(vw, vh)
+
+        area = Gtk.DrawingArea()
+        area.connect("draw", self._on_draw)
+        self.add(area)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.KEY_PRESS_MASK)
+        self.connect("button-press-event", self._on_press)
+        self.connect("motion-notify-event", self._on_motion)
+        self.connect("button-release-event", self._on_release)
+        self.connect("key-press-event", self._on_key)
+        self.connect("realize", self._on_realize)
+
+    @staticmethod
+    def _virtual_desktop():
+        display = Gdk.Display.get_default()
+        rects = [display.get_monitor(i).get_geometry() for i in range(display.get_n_monitors())]
+        x0, y0 = min(r.x for r in rects), min(r.y for r in rects)
+        x1 = max(r.x + r.width for r in rects)
+        y1 = max(r.y + r.height for r in rects)
+        return x0, y0, x1 - x0, y1 - y0
+
+    def _on_realize(self, _):
+        cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
+        self.get_window().set_cursor(cursor)
+
+    def _rect(self):
+        if not self._start or not self._end:
+            return None
+        (ax, ay), (bx, by) = self._start, self._end
+        return min(ax, bx), min(ay, by), abs(bx - ax), abs(by - ay)
+
+    def _on_draw(self, widget, cr):
+        alloc = widget.get_allocation()
+        W, H = alloc.width, alloc.height
+        if self._scaled is None or self._scaled.get_width() != W or self._scaled.get_height() != H:
+            self._scaled = self._pixbuf.scale_simple(W, H, GdkPixbuf.InterpType.BILINEAR)
+        Gdk.cairo_set_source_pixbuf(cr, self._scaled, 0, 0)
+        cr.paint()
+
+        cr.set_source_rgba(0, 0, 0, 0.45)
+        rect = self._rect()
+        if not rect:
+            cr.paint()
+            return False
+        x, y, w, h = rect
+        for band in ((0, 0, W, y), (0, y + h, W, H - y - h), (0, y, x, h), (x + w, y, W - x - w, h)):
+            cr.rectangle(*band)
+        cr.fill()
+        accent = KANAGAWA["accent"].lstrip("#")
+        cr.set_source_rgb(*(int(accent[i:i + 2], 16) / 255.0 for i in (0, 2, 4)))
+        cr.set_line_width(2)
+        cr.rectangle(x + 1, y + 1, max(0, w - 2), max(0, h - 2))
+        cr.stroke()
+        return False
+
+    def _on_press(self, _, event):
+        if event.button == 3:
+            self.destroy()
+        elif event.button == 1:
+            self._start = self._end = (event.x, event.y)
+            self.queue_draw()
+        return True
+
+    def _on_motion(self, _, event):
+        if self._start:
+            self._end = (event.x, event.y)
+            self.queue_draw()
+        return True
+
+    def _on_release(self, _, event):
+        if event.button != 1 or not self._start:
+            return True
+        self._end = (event.x, event.y)
+        x, y, w, h = self._rect()
+        if w < 4 or h < 4:                     # a stray click, not a drag
+            self._start = self._end = None
+            self.queue_draw()
+            return True
+        alloc = self.get_allocation()
+        sx = self.shot.width / float(alloc.width)
+        sy = self.shot.height / float(alloc.height)
+        self.result = self.shot.crop((int(x * sx), int(y * sy), int((x + w) * sx), int((y + h) * sy)))
+        self.destroy()
+        return True
+
+    def _on_key(self, _, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.destroy()
+        return True
+
+
+def capture_region(img_path):
+    """Region capture without slurp/grim. Returns False when cancelled."""
+    if platform_support.IS_MAC:
+        # Native interactive picker; leaves no file when the user hits Esc.
+        subprocess.run(["screencapture", "-i", "-x", img_path])
+        if not os.path.exists(img_path):
+            return False
+        platform_support.copy_image_to_clipboard(img_path)
+        return True
+
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        notify("Pillow is required for screen capture here (pip install pillow).")
+        return False
+    shot = ImageGrab.grab(all_screens=True)
+    selector = RegionSelector(shot)
+    selector.connect("destroy", Gtk.main_quit)
+    selector.show_all()
+    selector.present()
+    Gtk.main()
+    if selector.result is None:
+        return False
+    selector.result.save(img_path, "PNG")
+    platform_support.copy_image_to_clipboard(img_path)
+    return True
+
+
 def take_screenshot_and_analyze(sock_path):
     time.sleep(0.3)
+    img_dir = os.path.join(platform_support.data_dir(), "images")
+    img_name = f"cap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+
+    if not (platform_support.IS_LINUX and os.environ.get("WAYLAND_DISPLAY")):
+        os.makedirs(img_dir, exist_ok=True)
+        img_path = os.path.join(img_dir, img_name)
+        if not capture_region(img_path):
+            sys.exit(0)
+        send_cmd(sock_path, {"command": "analyze", "image_path": img_path})
+        return
+
     region = subprocess.run(["slurp"], capture_output=True, text=True).stdout.strip()
     if not region:
         sys.exit(0)
 
-    img_dir = os.path.expanduser("~/.local/share/ai_assistant/images")
     os.makedirs(img_dir, exist_ok=True)
-    img_path = os.path.join(img_dir, f"cap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    img_path = os.path.join(img_dir, img_name)
 
     subprocess.run(["grim", "-g", region, img_path], check=True)
     subprocess.run(f"wl-copy -t image/png < {img_path}", shell=True)
@@ -3532,6 +3839,35 @@ WAYBAR_TEXT = {
 }
 
 
+def status_lines(status):
+    """Human-readable AI Mode summary shared by the waybar tooltip and the tray."""
+    phase = status.get("phase", "off")
+    health = status.get("health") or {}
+    lines = []
+    if phase == "on":
+        lines.append("Servers up on :9090 and :9191")
+    elif phase == "error" and health:
+        lines.append("35B :9090 %s   0.5B :9191 %s" % (
+            "up" if health.get("big") else "DOWN",
+            "up" if health.get("small") else "DOWN"))
+        lines.append(status.get("error") or "")
+    elif phase == "starting":
+        lines.append("Loading models...")
+    elif phase == "error":
+        lines.append(status.get("error") or "Unknown error")
+    else:
+        lines.append("All AI subsystems stopped")
+
+    if status.get("external"):
+        lines.append("Externally started: " + ", ".join(status["external"]))
+    lines.append(f"{status.get('memories', 0)} memories stored")
+    if status.get("queued_jobs"):
+        lines.append(f"{status['queued_jobs']} screenshot(s) queued")
+    if status.get("session"):
+        lines.append("Note session active")
+    return lines
+
+
 def render_waybar(sock_path):
     """Print one JSON line for waybar's custom/ai module. Never fails loudly."""
     status = send_cmd(sock_path, {"command": "ai_mode_status"}, quiet=True, timeout=3.0)
@@ -3544,29 +3880,7 @@ def render_waybar(sock_path):
         }
     else:
         phase = status.get("phase", "off")
-        health = status.get("health") or {}
-        lines = []
-        if phase == "on":
-            lines.append("Servers up on :9090 and :9191")
-        elif phase == "error" and health:
-            lines.append("35B :9090 %s   0.5B :9191 %s" % (
-                "up" if health.get("big") else "DOWN",
-                "up" if health.get("small") else "DOWN"))
-            lines.append(status.get("error") or "")
-        elif phase == "starting":
-            lines.append("Loading models...")
-        elif phase == "error":
-            lines.append(status.get("error") or "Unknown error")
-        else:
-            lines.append("All AI subsystems stopped")
-
-        if status.get("external"):
-            lines.append("Externally started: " + ", ".join(status["external"]))
-        lines.append(f"{status.get('memories', 0)} memories stored")
-        if status.get("queued_jobs"):
-            lines.append(f"{status['queued_jobs']} screenshot(s) queued")
-        if status.get("session"):
-            lines.append("Note session active")
+        lines = status_lines(status)
         lines.append("Left click: toggle   Right click: chat")
 
         payload = {
@@ -3590,6 +3904,8 @@ def main():
     parser.add_argument("--sync", action="store_true", help="Manually push queued notes to Nextcloud")
     parser.add_argument("--say", type=str, help="Send a custom status event for the narrator to announce")
     parser.add_argument("--waybar", action="store_true", help="Print the waybar custom/ai module JSON")
+    parser.add_argument("--tray", action="store_true",
+                        help="Run the system-tray icon (Windows/macOS stand-in for waybar)")
     parser.add_argument("--ai-on", action="store_true", help="Enter AI Mode (start both llama.cpp servers)")
     parser.add_argument("--ai-off", action="store_true", help="Leave AI Mode and free all AI resources")
     parser.add_argument("--ai-toggle", action="store_true", help="Toggle AI Mode")
@@ -3601,7 +3917,7 @@ def main():
     sock_path = config["socket_path"]
 
     if args.daemon:
-        if not os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
+        if platform_support.IS_LINUX and not os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
             print(
                 "[AI Assistant] No WAYLAND_DISPLAY or DISPLAY is set, so the overlay bar "
                 "cannot be created. When starting from a service manager, give the service "
@@ -3618,6 +3934,16 @@ def main():
 
     if args.waybar:
         render_waybar(sock_path)
+        return
+
+    if args.tray:
+        import tray
+        tray.run(
+            config,
+            script_path=os.path.abspath(__file__),
+            request=lambda payload, timeout=3.0: send_cmd(sock_path, payload, quiet=True, timeout=timeout),
+            describe=status_lines,
+        )
         return
 
     if args.ai_on or args.ai_off or args.ai_toggle:
@@ -3659,7 +3985,7 @@ def main():
 
     # Capture needs the vision model; refuse instead of hanging on a dead port.
     if want_capture and ai_phase != "on":
-        notify(f"AI Mode is {ai_phase.upper()} -- enable it in waybar before capturing.")
+        notify(f"AI Mode is {ai_phase.upper()} -- enable it in {platform_support.STATUS_SURFACE} before capturing.")
         return
 
     if args.gui or not active_session:

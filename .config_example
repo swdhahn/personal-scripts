@@ -7,6 +7,9 @@ llama_url=http://127.0.0.1:9090/v1/chat/completions
 llama_model=Abiray/Huihui-Qwen3.6-35B-A3B-abliterated-GGUF:Q4_K_M
 session_history_dir=~/.local/share/ai_assistant/sessions
 socket_path=/tmp/ai_assistant.sock
+// Windows: the socket falls back to tcp://127.0.0.1:9393 automatically. Delete
+// the ~/.local/share lines in this file to use %LOCALAPPDATA%\ai_assistant instead.
+//socket_path=tcp://127.0.0.1:9393
 
 // Nextcloud WebDAV Configuration
 // Create an App Password in Nextcloud: Settings -> Security -> Devices & sessions
@@ -25,6 +28,13 @@ ai_mode_state_file=~/.local/share/ai_assistant/ai_mode.json
 ai_mode_start_timeout=180
 // Real-time signal waybar listens on, for instant module repaints
 waybar_signal=8
+
+// Tray icon (Windows/macOS stand-in for the waybar module)
+tray_start_daemon=1
+tray_poll_seconds=3
+hotkey_chat=ctrl+alt+a
+hotkey_capture=ctrl+alt+s
+hotkey_ai_toggle=ctrl+alt+shift+a
 
 // Small narrator model (used for spoken status updates)
 llama_small_url=http://127.0.0.1:9191/v1/chat/completions

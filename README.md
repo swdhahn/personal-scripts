@@ -11,7 +11,12 @@ Rename any config file to `.config` if you want to use it. There are a few confi
  - `nextcloud_user`: your Nextcloud username for WebDAV access.
  - `nextcloud_token`: a dedicated Nextcloud App Password (generated under *Settings -> Security -> Devices & sessions*).
  - `session_history_dir`: local directory where active session histories and captured screenshots are logged (defaults to `~/.local/share/ai_assistant/sessions`).
- - `socket_path`: UNIX socket path used for communication between the background daemon and the popup client (defaults to `/tmp/ai_assistant.sock`).
+ - `socket_path`: UNIX socket path used for communication between the background daemon and the popup client (defaults to `/tmp/ai_assistant.sock`). On Windows, which has no Python AF_UNIX support, this is a loopback address instead (`tcp://127.0.0.1:9393` by default; a Linux path in a shared `.config` falls back to it automatically). Requests must carry a random per-user token from `%LOCALAPPDATA%\ai_assistant\ipc_token`, so other users and web pages can't drive the daemon.
+
+**Tray icon** (Windows/macOS; see [Windows](#windows) below):
+ - `tray_start_daemon`: start the daemon when the tray comes up and finds it isn't running (defaults to `1`).
+ - `tray_poll_seconds`: how often the tray asks for status (defaults to `3`).
+ - `hotkey_chat` / `hotkey_capture` / `hotkey_ai_toggle`: global hotkeys on Windows (defaults `ctrl+alt+a`, `ctrl+alt+s`, `ctrl+alt+shift+a`). Modifiers are `ctrl`, `alt`, `shift`, `win`; keys are `a`–`z`, `0`–`9` or `f1`–`f24`. Leave a key empty to disable it.
 
 **AI Mode** (starting and stopping the local model servers):
  - `llama_server_cmd` / `llama_small_server_cmd`: the full `llama-server` command lines to run, one per line. These are what AI Mode starts; tokens are `~`-expanded individually, so model paths may use `~`.
@@ -123,6 +128,36 @@ ranks whole threads (best message match, title/summary overlap, recency), and
     "on-click-right": "python ~/Programming/scripts/ai-tools/ai_assistant.py --chat"
 }
 
+
+```
+
+#### Windows
+
+The same script runs on Windows 10/11. The pieces map like this:
+
+| Linux (Sway) | Windows |
+|---|---|
+| waybar `custom/ai` module | tray icon (`--tray`). Left click toggles AI Mode; the menu has chat, capture, session manager, sync, and daemon start/stop. Its colour follows the phase (aqua on, orange starting, red error, grey off/no daemon) and the tooltip shows the waybar text |
+| `$mod+a`-style Sway binds | global hotkeys registered by the tray (`hotkey_*` in `.config`) |
+| `gtk-layer-shell` overlay bar | an always-on-top popup, centred above the taskbar, that never takes focus |
+| `slurp` + `grim` + `wl-copy` | a full-screen drag-to-select overlay (Esc or right-click cancels). The capture is copied to the clipboard too |
+| `pw-play` | `winsound` (stdlib) |
+| `notify-send` | a message box |
+| UNIX socket | loopback TCP + token (see `socket_path`) |
+| `~/.local/share/ai_assistant` | `%LOCALAPPDATA%\ai_assistant` |
+| `dinit` service | the tray starts the daemon; `windows\install-startup.ps1` adds the tray to login |
+
+Setup:
+
+1. Install Python 3.10+ from python.org. The Microsoft Store stub won't work.
+2. Install a GTK 3 runtime with PyGObject. The simplest route is a [gvsbuild](https://github.com/wingtk/gvsbuild) GTK 3 release: unzip it to `C:\gtk`, then `pip install` the `PyGObject` and `pycairo` wheels from its `wheels` folder into the same Python. The script finds `C:\gtk\bin` (or `C:\gtk-build\gtk\x64\release\bin`) on its own; set `AI_ASSISTANT_GTK_BIN` if yours is elsewhere.
+3. Put `llama-server.exe` on `PATH` (or use a full path in `llama_server_cmd`). Backslashes in config commands are fine, and paths with spaces need quotes.
+4. Run it once from a terminal so you can watch the `.venv` bootstrap: `python ai-tools\ai_assistant.py --tray`. On Windows it also installs `pystray` and `pillow`. `kokoro-onnx` / `soundfile` are attempted once; if they can't install, narration stays silent and nothing else breaks.
+5. Optional: start at login with `powershell -ExecutionPolicy Bypass -File ai-tools\windows\install-startup.ps1` (`-Remove` undoes it).
+
+The daemon's output goes to `%LOCALAPPDATA%\ai_assistant\logs\daemon.log` when the tray starts it. ODT targets may be local Windows paths (`C:\Notes\x.odt`, `file:///C:/Notes/x.odt`) as well as Nextcloud paths.
+
+macOS uses the same tray. Install GTK with `brew install gtk+3 pygobject3`; capture uses the native `screencapture -i` picker. It hasn't been tested there yet.
 
 #### Dependencies (Artix Linux)
 
