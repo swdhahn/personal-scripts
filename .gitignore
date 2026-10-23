@@ -1,2 +1,4 @@
 .config
 ai-tools/.venv/
+__pycache__/
+*.pyc

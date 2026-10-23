@@ -13,3 +13,30 @@ socket_path=/tmp/ai_assistant.sock
 nextcloud_url=https://your-nextcloud.domain.com
 nextcloud_user=your_username
 nextcloud_token=your_app_password_token
+
+// AI Mode -- llama.cpp server commands, one line each.
+// Clicking the waybar "AI" module starts these; clicking again kills them and
+// frees every AI resource (useful before launching a game).
+llama_server_cmd=llama-server --port 9090 --parallel 1 -c 4096 -ngl 10 --image-min-tokens 1024 -m /path/to/vision-model.gguf --mmproj /path/to/mmproj-BF16.gguf
+llama_small_server_cmd=llama-server --port 9191 -hf Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q8_0 -c 1024 --parallel 1 -ngl 99
+llama_health_url=http://127.0.0.1:9090/health
+llama_small_health_url=http://127.0.0.1:9191/health
+ai_mode_state_file=~/.local/share/ai_assistant/ai_mode.json
+ai_mode_start_timeout=180
+// Real-time signal waybar listens on, for instant module repaints
+waybar_signal=8
+
+// Small narrator model (used for spoken status updates)
+llama_small_url=http://127.0.0.1:9191/v1/chat/completions
+llama_small_model=Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q8_0
+
+// Chat memory database
+memory_db_path=~/.local/share/ai_assistant/memory.db
+// How many remembered items get injected into each chat turn
+memory_top_k=6
+// Days after which a memory's relevance score has decayed by ~63%
+memory_recency_half_life_days=30
+memory_min_importance=0.25
+// Chat turns longer than this many bytes are stored zlib-compressed
+memory_compress_threshold=2048
+memory_summarize_after=20
