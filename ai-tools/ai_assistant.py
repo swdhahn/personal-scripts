@@ -106,6 +106,7 @@ import re
 import io
 import gc
 import json
+import asyncio
 import time
 import queue
 import shlex
@@ -131,6 +132,8 @@ from odf.style import Style, TextProperties, ParagraphProperties
 from odf.text import P, H, Span, List as OdfList, ListItem as OdfListItem
 
 import memory_db
+from asyncbridge import AsyncBridge
+from orchestrator import MemoryGateway, Orchestrator
 
 platform_support.prepare_gtk_dll_path()
 import gi
@@ -195,8 +198,56 @@ def load_config():
         "memory_top_k": "6",
         "memory_recency_half_life_days": "30",
         "memory_min_importance": "0.25",
+        "memory_min_coverage": "0.5",    # share of query terms a memory must match
+        "memory_min_score": "0.05",
         "memory_compress_threshold": "2048",
         "memory_summarize_after": "20",
+
+        # --- Context budget & compression ---
+        # A reasoning model spends tokens thinking before it writes anything,
+        # so the reply needs far more headroom than a plain model would.
+        "context_reserve_completion": "4096",   # tokens kept free for the reply
+        "context_safety_margin": "256",
+        "context_compress_at": "0.9",           # fraction of the budget
+        "context_history_turns": "12",
+        "context_keep_recent_turns": "4",       # kept verbatim when folding
+        "context_tool_share": "0.5",            # max share of budget for tools
+        "context_min_memories": "2",            # recall floor before shedding turns
+        "context_summary_model": "large",       # large | small
+
+        # --- Router (constrained decoding on the 0.5B model) ---
+        "router_enabled": "1",
+        "router_debug": "0",
+
+        # --- Live commentary (0.5B narrates while the 35B works) ---
+        # Background work (screenshot capture, note sync, session changes) is
+        # announced out loud. The chat window is NOT: you are sitting in front
+        # of the text as it streams, so narrating it is just noise.
+        "commentary_enabled": "1",
+        "commentary_in_chat": "0",
+        "commentary_interval": "9",
+        "commentary_max_lines": "6",
+
+        # --- Web search tool ---
+        "web_search_searx_url": "",
+        "web_search_timeout": "12",
+        "web_search_fetch_pages": "1",
+        "web_search_page_chars": "2500",
+
+        # --- Command-line tool (bubblewrap sandbox) ---
+        "cli_policy": "ask",                 # deny | ask | allow
+        "cli_timeout": "20",
+        "cli_output_limit": "8000",
+        "cli_allow_shell": "0",
+        "cli_allow_network": "0",
+        "cli_ai_user": "",                   # only used when the daemon is root
+        "cli_workspace": os.path.expanduser("~/.local/share/ai_assistant/sandbox"),
+        "cli_fs_mode": "ro-root",            # ro-root | minimal
+        "cli_readable_paths": os.path.expanduser("~/Programming"),
+        "cli_mask_paths": "",                # ":"-separated; empty = built-in list
+        "cli_extra_allow": "",
+        "cli_extra_auto_ok": "",
+
         "chat_system_prompt": (
             "You are a concise, technically fluent desktop assistant running locally on the "
             f"user's {platform_support.OS_NAME} machine. You have a persistent memory of past conversations: relevant "
@@ -510,6 +561,14 @@ button.send-btn label {{ color: {accent}; font-size: 17px; }}
 button.send-btn:hover {{ background-color: {raised}; }}
 button.send-btn:disabled {{ background-color: transparent; }}
 button.send-btn:disabled label {{ color: {nontext}; }}
+button.send-btn.stopping label {{ color: {error}; }}
+button.copy-btn {{
+    background-color: transparent; border: none; box-shadow: none;
+    padding: 1px 6px; min-height: 0; min-width: 0;
+}}
+button.copy-btn label {{ color: {nontext}; font-size: 11px; }}
+button.copy-btn:hover label {{ color: {accent}; }}
+button.copy-btn:hover {{ background-color: {raised}; }}
 
 /* ---- jump-to-bottom pill, overlaid on the transcript ---- */
 button.scroll-btn {{
@@ -1347,13 +1406,22 @@ class AssistantDaemon:
     def _speech_worker(self):
         """Worker loop that processes operational status updates into speech sequentially."""
         while True:
-            raw_event = self.speech_queue.get()
+            job = self.speech_queue.get()
+            if isinstance(job, str):
+                job = {"text": job, "raw": False, "done": None}
             try:
-                spoken_script = self._formulate_status_sentence(raw_event)
-                self._play_kokoro_tts(spoken_script)
+                text = job.get("text", "")
+                # Live-commentary lines are already finished sentences written by
+                # the 0.5B model, so a second rewrite round trip would only add
+                # latency to the thing whose entire purpose is to hide latency.
+                script = text if job.get("raw") else self._formulate_status_sentence(text)
+                self._play_kokoro_tts(script)
             except Exception as e:
                 print(f"Narrator pipeline error: {e}", file=sys.stderr)
             finally:
+                done = job.get("done") if isinstance(job, dict) else None
+                if done is not None:
+                    done.set()
                 self.speech_queue.task_done()
 
     def announce_event(self, event_description):
@@ -1364,7 +1432,22 @@ class AssistantDaemon:
         """
         if not self.require_ai():
             return
-        self.speech_queue.put(event_description)
+        self.speech_queue.put({"text": event_description, "raw": False, "done": None})
+
+    def speak_now(self, text, wait=False, timeout=45.0):
+        """Speak a ready-made sentence verbatim (live commentary path).
+
+        Returns the queue depth; with wait=True it blocks until this specific
+        utterance has finished playing, which is what throttles the narrator.
+        """
+        if not text or not self.require_ai():
+            return -1
+        done = threading.Event() if wait else None
+        self.speech_queue.put({"text": text, "raw": True, "done": done})
+        depth = self.speech_queue.qsize()
+        if done is not None:
+            done.wait(timeout)
+        return depth
 
     def _extract_note_title(self, md_text):
         """Extracts the primary heading or topic title from the AI's Markdown response."""
@@ -1537,7 +1620,12 @@ class AssistantDaemon:
     def _drain(q):
         try:
             while True:
-                q.get_nowait()
+                job = q.get_nowait()
+                # A commentary line may have a caller blocked on its playback;
+                # releasing it here keeps the chat window from stalling when AI
+                # Mode is switched off mid-turn.
+                if isinstance(job, dict) and job.get("done") is not None:
+                    job["done"].set()
                 q.task_done()
         except queue.Empty:
             pass
@@ -1858,18 +1946,37 @@ class AssistantDaemon:
             finally:
                 self.memory_queue.task_done()
 
-    DISTILL_SYSTEM = (
-        "You extract durable long-term memories from a conversation between a user and their "
-        "local assistant. Reply with ONE JSON object and nothing else:\n"
-        '{"summary": "<2-3 sentence recap>", "title": "<short thread title>", '
-        '"tags": ["topic", ...], "importance": 0.0-1.0, '
-        '"memories": [{"kind": "fact|preference|project|event", "content": "<one self-contained '
-        'sentence>", "importance": 0.0-1.0, "tags": ["topic", ...]}]}\n'
-        "Record only things worth recalling weeks later: decisions, preferences, configuration, "
-        "names, ports, paths, ongoing projects, commitments. Each memory must stand alone without "
-        "the conversation. Skip pleasantries and anything transient. Prefer 0 memories over "
-        "speculation. Use at most 6."
-    )
+    DISTILL_SYSTEM = """You extract durable long-term memories about THE USER from a \
+conversation with their local assistant. Reply with ONE JSON object and nothing else:
+{"summary": "<2-3 sentence recap>", "title": "<short thread title>", "tags": ["topic", ...],
+ "importance": 0.0-1.0,
+ "memories": [{"kind": "fact|preference|project|event",
+               "content": "<one self-contained sentence about the user>",
+               "importance": 0.0-1.0, "tags": ["topic", ...]}]}
+
+STORE ONLY what is true of this particular person and could not be looked up anywhere else:
+  - who they are: where they live, what they own, their work, their family
+  - what they prefer: tools, style, formats, how they want to be answered
+  - their setup: hardware, distro, window manager, ports, paths, config values
+  - their projects, plans, decisions and commitments
+
+NEVER store general knowledge, or anything a web search could answer:
+  - facts about the world, science, history, products or specifications
+  - what calibre a rifle accepts, what a dolphin eats, what a law says
+  - the current date or time, the day of the week, what holiday it is
+  - news, prices, versions, or anything else that changes on its own
+  - anything the assistant said that was not about the user
+
+Good: The user lives in Orange, CA.
+Good: The user prefers tabs over spaces.
+Good: The user owns a Ruger American Gen II Scout rifle.
+Good: The user runs Sway on Artix Linux with dinit.
+Bad:  The Ruger American Gen II Scout accepts .308 Winchester.
+Bad:  Today is Tuesday, October 27, 2026.
+Bad:  Dolphin meat bioaccumulates mercury.
+
+Every memory must name the user or something of theirs, and must stand alone without the
+conversation. Prefer 0 memories over speculation. Use at most 6."""
 
     def _llm_json(self, system_prompt, user_content, max_tokens=2048):
         resp = requests.post(
@@ -1882,11 +1989,22 @@ class AssistantDaemon:
                 ],
                 "temperature": 0.2,
                 "max_tokens": max_tokens,
+                # The 35B is a reasoning model: left to think, it spends the
+                # whole token budget in reasoning_content and returns an empty
+                # content with finish_reason="length". Distillation then has no
+                # JSON to parse and the memory store fills up with raw dumps.
+                "chat_template_kwargs": {"enable_thinking": False},
             },
             timeout=180,
         )
         resp.raise_for_status()
-        return extract_json(resp.json()["choices"][0]["message"]["content"])
+        resp.encoding = "utf-8"
+        content = resp.json()["choices"][0]["message"]["content"] or ""
+        data = extract_json(content)
+        if data is None and not content.strip():
+            print("[memory] distillation returned no content; skipping this batch",
+                  file=sys.stderr)
+        return data
 
     def _distill(self, job):
         conversation_id = job.get("conversation_id")
@@ -1907,20 +2025,27 @@ class AssistantDaemon:
 
         data = self._llm_json(self.DISTILL_SYSTEM, transcript)
         if not isinstance(data, dict):
-            # Never lose the exchange: keep a raw summary row instead.
-            self.remember(
-                transcript[:1500], kind="summary", importance=0.3,
-                tags=["unparsed"], conversation_id=conversation_id,
-            )
-            self._refresh_mem_count()
+            # Deliberately store nothing. The exchange is already safe in the
+            # messages table, so a raw transcript row adds no durability -- it
+            # only pollutes recall: these dumps are ~1.4kB against ~60 bytes for
+            # a real memory, and one shared common word ("write") is enough for
+            # them to outrank genuine facts and derail an unrelated answer.
+            print(f"[memory] could not distill conversation {conversation_id}; "
+                  "nothing stored", file=sys.stderr)
             return
 
         base_tags = [t for t in (data.get("tags") or []) if isinstance(t, str)]
-        items = []
+        items, rejected = [], []
         for raw in (data.get("memories") or [])[:6]:
             if isinstance(raw, str):
                 raw = {"content": raw}
             if not isinstance(raw, dict) or not str(raw.get("content", "")).strip():
+                continue
+            # The prompt asks for personal memories only; this is what enforces
+            # it. Without it the store fills with rifle calibres and what day
+            # it is -- things the model can look up or already knows.
+            if not memory_db.is_personal(str(raw["content"]), raw.get("kind")):
+                rejected.append(str(raw["content"])[:80])
                 continue
             tags = [t for t in (raw.get("tags") or []) if isinstance(t, str)] or base_tags
             items.append({
@@ -1929,6 +2054,11 @@ class AssistantDaemon:
                 "importance": raw.get("importance", data.get("importance", 0.5)),
                 "tags": tags,
             })
+
+        if rejected:
+            print("[memory] skipped %d impersonal memor%s: %s"
+                  % (len(rejected), "y" if len(rejected) == 1 else "ies",
+                     " | ".join(rejected)), file=sys.stderr)
 
         summary = (data.get("summary") or "").strip()
         with self.mem_lock:
@@ -2009,6 +2139,21 @@ class AssistantDaemon:
                     payload = memory_db.stats(self.mem)
                 conn.sendall(json.dumps(payload).encode("utf-8"))
 
+            elif cmd == "memory_purge_impersonal":
+                with self.mem_lock:
+                    payload = memory_db.purge_impersonal(
+                        self.mem, dry_run=bool(req.get("dry_run", True)),
+                        keep=req.get("keep") or ())
+                self._refresh_mem_count()
+                conn.sendall(json.dumps(payload).encode("utf-8"))
+
+            elif cmd == "memory_purge_dumps":
+                with self.mem_lock:
+                    payload = memory_db.purge_raw_dumps(
+                        self.mem, dry_run=bool(req.get("dry_run", True)))
+                self._refresh_mem_count()
+                conn.sendall(json.dumps(payload).encode("utf-8"))
+
             elif cmd == "memory_compact":
                 with self.mem_lock:
                     payload = memory_db.compact(self.mem)
@@ -2071,6 +2216,11 @@ class AssistantDaemon:
                     if pending > 1:
                         self.bar.show_message(f"Screenshot queued ({pending} in queue)...", timeout=3)
                     conn.sendall(json.dumps({"status": "queued", "position": pending}).encode("utf-8"))
+
+            elif cmd == "speak":
+                depth = self.speak_now(req.get("text", ""),
+                                       wait=bool(req.get("wait")))
+                conn.sendall(json.dumps({"status": "ok", "queue": depth}).encode("utf-8"))
 
             elif cmd == "announce":
                 msg = req.get("message", "")
@@ -2498,6 +2648,8 @@ ICON_SEND = ""        # paper plane
 ICON_MENU = "☰"        # hamburger
 ICON_DOWN = "↓"
 ICON_NEW = ""         # plus
+ICON_STOP = ""        # filled square -- replaces send while generating
+ICON_COPY = ""        # two sheets
 
 SHORTCUTS = [
     ("Enter", "send"),
@@ -2631,13 +2783,41 @@ class ChatPopup(Gtk.Window):
         self._stream_frame = None
         self._stream_label = None
         self._stats_label = None
+        self._think_box = None          # live reasoning panel for this turn
+        self._think_collapsed = False
         self._stats = {}
         self.session_tokens = 0
         self.context_size = context_size(config)
+        self._ctx_used = 0
+        self._ctx_limit = 0      # usable prompt budget
+        self._ctx_window = 0     # the server's actual n_ctx
+        self._ctx_info = {}      # full payload of the last context event
         self._stick_to_bottom = True
         self._anchor = None          # held scroll position while detached
         self._conv_rows = []
         self._mem_rows = []
+
+        # --- asyncio orchestrator (router -> tools -> model -> commentary) ---
+        self.router_enabled = str(config.get("router_enabled", "1")).lower() in ("1", "true", "yes")
+        self.bridge = AsyncBridge()
+        self.gateway = MemoryGateway(
+            self.db, self.db_lock, top_k=self.top_k, half_life=self.half_life,
+            min_importance=self.min_importance, compress_threshold=self.compress_threshold,
+            min_coverage=config_num(config, "memory_min_coverage", 0.5, float),
+            min_score=config_num(config, "memory_min_score", 0.05, float),
+        )
+        # Voice is for work you are not watching. In the chat window the reply
+        # is already streaming in front of you, so the narrator stays silent
+        # unless commentary_in_chat is explicitly turned on.
+        self.commentary_in_chat = str(
+            config.get("commentary_in_chat", "0")).lower() in ("1", "true", "yes")
+        self.orchestrator = Orchestrator(
+            config, self.gateway,
+            speak=self._speak_async if self.commentary_in_chat else None,
+            approval_cb=self._approve_command,
+            debug=str(config.get("router_debug", "0")).lower() in ("1", "true", "yes"),
+        )
+        self._turn = None            # the in-flight asyncio future, for cancel
 
         status = send_cmd(sock_path, {"command": "ai_mode_status"}, quiet=True) or {}
         self.ai_ready = status.get("phase") == "on"
@@ -2749,7 +2929,7 @@ class ChatPopup(Gtk.Window):
         self.send_btn = style(Gtk.Button(label=ICON_SEND), "send-btn")
         self.send_btn.set_tooltip_text("Send  (Enter)")
         self.send_btn.set_valign(Gtk.Align.END)
-        self.send_btn.connect("clicked", self.on_send)
+        self.send_btn.connect("clicked", self._on_send_or_stop)
         self.send_btn.set_sensitive(self.ai_ready)
         bar.pack_start(self.send_btn, False, False, 0)
 
@@ -2864,15 +3044,143 @@ class ChatPopup(Gtk.Window):
         model = self.config.get("llama_model", "local model").split("/")[-1]
         self.title_label.set_text(f"{name}   -   {model}")
 
+        self._refresh_usage()
+
+    def _completion_tokens(self):
+        """Tokens generated so far this turn, including earlier tool rounds."""
+        return (self._stats.get("done_completion", 0)
+                + self._stats.get("cur_completion", 0))
+
+    def _refresh_usage(self):
+        """Live context readout. Cheap: touches labels only, no database.
+
+        The figure shown is prompt + everything generated so far, because that
+        is what this turn will cost the NEXT prompt once the reply is stored.
+        Showing only the measured prompt made the number look frozen while
+        thousands of tokens were streaming in.
+        """
+        label = getattr(self, "usage_label", None)
+        if label is None:
+            return
+        budget = getattr(self, "_ctx_limit", 0)
+        measured = getattr(self, "_ctx_used", 0)
+        generated = self._completion_tokens()
+        live = measured + generated
+
         bits = []
-        prompt = self._stats.get("prompt", 0)
-        if prompt:
-            bits.append(f"ctx {fmt_count(prompt)}/{fmt_count(self.context_size)}"
-                        if self.context_size else f"ctx {fmt_count(prompt)}")
+        if measured and budget:
+            bits.append(f"ctx {fmt_count(live)}/{fmt_count(budget)}")
+        elif self._stats.get("prompt"):
+            bits.append(f"ctx {fmt_count(self._stats['prompt'])}")
         if self.session_tokens:
             bits.append(f"session {fmt_count(self.session_tokens)} tok")
-        if getattr(self, "usage_label", None) is not None:
-            self.usage_label.set_text("   ".join(bits))
+        label.set_text("   ".join(bits))
+        label.set_tooltip_text(self._usage_tooltip(measured, generated, live, budget))
+
+    def _usage_tooltip(self, measured, generated, live, budget):
+        info = getattr(self, "_ctx_info", {}) or {}
+        window = info.get("n_ctx") or getattr(self, "_ctx_window", 0)
+        reserve = info.get("reserve", 0)
+        safety = info.get("safety", 0)
+        trigger = info.get("trigger", 0)
+        breakdown = info.get("breakdown") or {}
+        counts = breakdown.get("counts") or {}
+
+        lines = ["HOW THE CONTEXT BUDGET WORKS", ""]
+        if window:
+            lines += [
+                f"  {window:>7,}  the model's context window (-c on the server)",
+                f"- {reserve:>7,}  reserved so the reply has room to generate",
+                f"- {safety:>7,}  safety margin for template overhead",
+                f"= {budget:>7,}  usable for the prompt  <- the number on the right",
+                "",
+            ]
+        if breakdown:
+            lines.append("THIS TURN'S PROMPT")
+            rows = [
+                ("system prompt", breakdown.get("system prompt", 0), ""),
+                ("tool instructions", breakdown.get("tool instructions", 0), ""),
+                ("tool schemas", breakdown.get("tool schemas", 0), ""),
+                ("conversation summary", breakdown.get("conversation summary", 0), ""),
+                ("recalled memories", breakdown.get("recalled memories", 0),
+                 f"{counts.get('memories', 0)} item(s)"),
+                ("history turns", breakdown.get("history turns", 0),
+                 f"{counts.get('history_turns', 0)} turn(s)"),
+                ("tool output", breakdown.get("tool output", 0),
+                 f"{counts.get('tool_blocks', 0)} block(s)"),
+                ("your message", breakdown.get("your prompt", 0), ""),
+            ]
+            accounted = sum(value for _, value, _ in rows)
+            for name, value, extra in rows:
+                if value or name in ("your message", "system prompt"):
+                    note = f"   ({extra})" if extra else ""
+                    lines.append(f"  {value:>7,}  {name}{note}")
+            scaffold = measured - accounted
+            if scaffold:
+                lines.append(f"  {scaffold:>7,}  chat-template scaffolding")
+            lines += [f"  {measured:>7,}  measured prompt total", ""]
+
+        # Thinking and answer are both generated into the same KV cache, but
+        # only the answer is stored, so only the answer comes back as part of
+        # the next prompt. Splitting them is the difference between "I am
+        # nearly out of room" and "I was never going to be".
+        think_chars = len(getattr(self, "_stream_reasoning", "") or "")
+        think_tok = min(generated, think_chars // 4) if think_chars else 0
+        answer_tok = max(0, generated - think_tok)
+
+        lines.append("THIS TURN SO FAR")
+        lines.append(f"  {measured:>7,}  prompt sent")
+        if think_tok:
+            lines.append(f"+ {think_tok:>7,}  thinking (approx; discarded after this turn)")
+            lines.append(f"+ {answer_tok:>7,}  answer so far (kept)")
+        elif generated:
+            lines.append(f"+ {generated:>7,}  generated so far")
+        pct = (100.0 * live / budget) if budget else 0.0
+        lines.append(f"= {live:>7,}  of {budget:,} ({pct:.0f}%) held in the window now")
+        if think_tok:
+            nxt = measured + answer_tok
+            lines.append(f"  {nxt:>7,}  what the NEXT prompt will carry "
+                         f"({100.0 * nxt / budget:.0f}%)" if budget else "")
+        if window:
+            lines += ["", "There is one context window, not two. The reserve is not a "
+                          "separate space: it is room left unused by the prompt so the "
+                          "reply (thinking included) has somewhere to generate."]
+        if trigger:
+            lines += ["", f"Compression starts once a prompt passes {trigger:,}: "
+                          "oldest turns are folded into a running summary, so the "
+                          "conversation keeps going rather than hitting a wall."]
+        if info.get("steps"):
+            lines += ["", "Compressed this turn: " + "; ".join(info["steps"])]
+        if info.get("model"):
+            lines.append(f"Answered by the {info['model']} model.")
+        return "\n".join(lines)
+
+    def _copy_to_clipboard(self, text, what="Response"):
+        """Put text on the clipboard and confirm it on the button itself."""
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clip.set_text(text or "", -1)
+        # Hand ownership to the clipboard manager so the text outlives the
+        # window; without this a copy is lost the moment the chat closes.
+        clip.store()
+        print(f"[chat] copied {len(text or '')} chars ({what})", file=sys.stderr)
+
+    def _copy_button(self, get_text, what="Response", label=None):
+        btn = style(Gtk.Button(label=label or f"{ICON_COPY}  copy"), "copy-btn")
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.set_tooltip_text(f"Copy {what.lower()} to the clipboard")
+        original = btn.get_label()
+
+        def restore():
+            btn.set_label(original)
+            return False
+
+        def on_click(_b):
+            self._copy_to_clipboard(get_text(), what)
+            btn.set_label("copied")
+            GLib.timeout_add(1200, restore)
+
+        btn.connect("clicked", on_click)
+        return btn
 
     def _plain_label(self, text, selectable=True):
         label = Gtk.Label(label=text, xalign=0.0)
@@ -2887,9 +3195,11 @@ class ChatPopup(Gtk.Window):
 
     def _code_widget(self, language, code):
         box = style(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2), "code-block")
-        if language:
-            box.pack_start(style(Gtk.Label(label=language, xalign=0.0), "code-lang"),
-                           False, False, 0)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        header.pack_start(style(Gtk.Label(label=language or "", xalign=0.0), "code-lang"),
+                          False, False, 0)
+        header.pack_end(self._copy_button(lambda: code, "Code block"), False, False, 0)
+        box.pack_start(header, False, False, 0)
         label = Gtk.Label(xalign=0.0)
         label.set_selectable(True)
         label.set_markup(f'<tt>{highlight_code(code, language)}</tt>')
@@ -2931,13 +3241,21 @@ class ChatPopup(Gtk.Window):
         scroll.add(grid)
         return scroll
 
-    def _thinking_widget(self, text):
-        """Collapsed dropdown holding the model's reasoning for this turn."""
+    def _thinking_widget(self, text, expanded=False, live=False):
+        """Dropdown holding the model's reasoning for this turn.
+
+        `live=True` keeps a handle on the body label so reasoning can be
+        appended as it streams; the panel then collapses itself the moment the
+        answer starts, so you can watch the model think without the finished
+        reply being pushed off screen by it.
+        """
         expander = style(Gtk.Expander(), "think-box")
-        expander.set_label(f"Thinking  ({fmt_count(len(text))} characters)")
-        expander.set_expanded(False)
+        expander.set_label("Thinking\u2026" if live
+                           else f"Thinking  ({fmt_count(len(text))} characters)")
+        expander.set_expanded(expanded)
 
         body = style(self._plain_label(text), "think-body")
+        body.set_line_wrap(True)
         inner = style(Gtk.Viewport(), "think-surface")
         inner.set_shadow_type(Gtk.ShadowType.NONE)
         inner.add(body)
@@ -2948,6 +3266,9 @@ class ChatPopup(Gtk.Window):
         scroll.set_overlay_scrolling(False)
         scroll.add(inner)
         expander.add(scroll)
+        if live:
+            expander._body = body
+            expander._scroll = scroll
         return expander
 
     def _fill_markdown(self, frame, text):
@@ -2982,6 +3303,18 @@ class ChatPopup(Gtk.Window):
             self._fill_markdown(frame, text)
         else:
             frame.pack_start(self._plain_label(text, selectable=False), False, False, 0)
+
+        # The raw markdown is what people want on the clipboard, not the
+        # rendered widgets, so keep it on the frame for the copy button.
+        frame._raw_text = text
+        if role == "assistant":
+            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            actions.pack_end(
+                self._copy_button(lambda f=frame: getattr(f, "_raw_text", ""),
+                                  "Response"),
+                False, False, 0)
+            row.pack_start(actions, False, False, 0)
+            frame._actions = actions
         row.show_all()
         self._maybe_autoscroll()
         return frame
@@ -3080,7 +3413,9 @@ class ChatPopup(Gtk.Window):
 
         if key == Gdk.KEY_Escape:
             # Unwind the UI one step at a time before closing the window.
-            if self.conv_search.get_text() or self.mem_search.get_text():
+            if self.busy:
+                self.on_stop(None)
+            elif self.conv_search.get_text() or self.mem_search.get_text():
                 self.conv_search.set_text("")
                 self.mem_search.set_text("")
                 self._focus_input()
@@ -3395,6 +3730,34 @@ class ChatPopup(Gtk.Window):
         start, end = buf.get_bounds()
         return buf.get_text(start, end, True).strip()
 
+    def _on_send_or_stop(self, _widget):
+        """One button, two jobs: send when idle, stop while generating."""
+        if self.busy:
+            self.on_stop(None)
+        else:
+            self.on_send(None)
+
+    def _set_send_mode(self, stopping):
+        """Swap the send button into a stop button and back."""
+        btn = self.send_btn
+        btn.set_label(ICON_STOP if stopping else ICON_SEND)
+        btn.set_tooltip_text("Stop generating  (Esc)" if stopping else "Send  (Enter)")
+        ctx = btn.get_style_context()
+        (ctx.add_class if stopping else ctx.remove_class)("stopping")
+        # Stop must stay clickable precisely when sending is not allowed.
+        btn.set_sensitive(True if stopping else self.ai_ready)
+
+    def on_stop(self, _):
+        """Cancel the in-flight turn, keeping whatever has already streamed."""
+        if not self.busy:
+            return
+        if self._turn is not None:
+            self._turn.cancel()
+        partial = strip_think(self._stream_raw).strip()
+        self._add_notice("Stopped." if partial else "Stopped before any reply arrived.",
+                         css="memory-chip")
+        self._finish_turn(partial, None)
+
     def on_send(self, _):
         if self.busy or not self.ai_ready:
             return
@@ -3403,7 +3766,7 @@ class ChatPopup(Gtk.Window):
             return
         self.input_view.get_buffer().set_text("")
         self.busy = True
-        self.send_btn.set_sensitive(False)
+        self._set_send_mode(True)
 
         first_turn = not self.conversation_id
         self._ensure_conversation()
@@ -3418,6 +3781,13 @@ class ChatPopup(Gtk.Window):
         # and syntax highlighting are rendered once the reply is complete.
         self._stream_frame = self._add_bubble("assistant", "...", markdown=False)
         self._stream_label = self._stream_frame.get_children()[0]
+        # Live reasoning panel, above the answer, open until the answer starts.
+        self._think_box = self._thinking_widget("", expanded=True, live=True)
+        self._stream_frame.pack_start(self._think_box, False, False, 0)
+        self._stream_frame.reorder_child(self._think_box, 0)
+        self._think_box.show_all()
+        self._think_collapsed = False
+        self._think_mark = 0
         self._stats_label = style(Gtk.Label(xalign=1.0), "chat-stats")
         self._stats_label.set_text("…")
         row = self._stream_frame.get_parent()
@@ -3426,7 +3796,10 @@ class ChatPopup(Gtk.Window):
         self._stick_to_bottom = True
         if first_turn:
             self._refresh_title()
-        threading.Thread(target=self._chat_worker, args=(text,), daemon=True).start()
+        if self.router_enabled:
+            self._turn = self.bridge.spawn(self._run_turn(text))
+        else:
+            threading.Thread(target=self._chat_worker, args=(text,), daemon=True).start()
 
     def on_new_chat(self, _):
         if self.busy:
@@ -3452,6 +3825,9 @@ class ChatPopup(Gtk.Window):
             self._add_notice("Could not reach the daemon to compact memory.")
 
     def _on_destroy(self, _widget):
+        if self._turn is not None:
+            self._turn.cancel()
+        self.bridge.shutdown()
         self._discard_if_empty()
         Gtk.main_quit()
 
@@ -3627,6 +4003,150 @@ class ChatPopup(Gtk.Window):
 
         GLib.idle_add(self._finish_turn, strip_think(self._stream_raw), None)
 
+    # ==================================================================
+    # ASYNC TURN -- router -> tools -> model, narrated by the 0.5B model
+    # ==================================================================
+    async def _run_turn(self, user_text):
+        """Runs on the AsyncBridge loop. Every UI touch goes via GLib.idle_add."""
+        answer, error = "", None
+        try:
+            async for event in self.orchestrator.handle(user_text, self.conversation_id):
+                kind, payload = event.kind, event.payload
+                if kind == "delta":
+                    GLib.idle_add(self._append_delta, payload)
+                elif kind == "reasoning":
+                    self._stream_reasoning += payload
+                    GLib.idle_add(self._note_thinking, len(self._stream_reasoning))
+                elif kind == "usage":
+                    self._absorb_timings(payload)
+                elif kind == "decision":
+                    GLib.idle_add(self._note_decision, payload)
+                elif kind == "recall":
+                    GLib.idle_add(self._show_recalled, payload)
+                elif kind == "tool_start":
+                    GLib.idle_add(self._note_tool_start, payload)
+                elif kind == "tool_result":
+                    GLib.idle_add(self._note_tool_result, payload)
+                elif kind == "context":
+                    GLib.idle_add(self._note_context, payload)
+                elif kind == "notice":
+                    GLib.idle_add(self._add_notice, payload, "memory-chip")
+                elif kind == "error":
+                    error = payload
+                elif kind == "done":
+                    answer = payload["answer"]
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                        # noqa: BLE001
+            error = f"Chat error: {e}"
+        GLib.idle_add(self._finish_turn, answer or strip_think(self._stream_raw), error)
+
+    def _absorb_timings(self, timings):
+        """llama.cpp per-token timings -> the live tok/s readout.
+
+        predicted_n restarts from zero on every round, so a tool call midway
+        through a turn would make the live counter jump backwards. Bank the
+        finished round before the new one starts.
+        """
+        predicted = timings.get("predicted_n") or 0
+        previous = self._stats.get("cur_completion", 0)
+        if predicted < previous:
+            self._stats["done_completion"] = (
+                self._stats.get("done_completion", 0) + previous)
+            self._stats["done_ms"] = (self._stats.get("done_ms", 0.0)
+                                      + self._stats.get("cur_ms", 0.0))
+        self._stats["cur_completion"] = predicted
+        self._stats["cur_ms"] = timings.get("predicted_ms") or 0.0
+        self._stats["cur_tps"] = timings.get("predicted_per_second") or 0.0
+        if timings.get("prompt_n"):
+            self._stats["prompt"] = timings["prompt_n"]
+            self._stats["prompt_tps"] = timings.get("prompt_per_second") or 0.0
+
+    async def _speak_async(self, text):
+        """Hand one commentary line to the daemon's Kokoro queue and wait for it.
+
+        Awaiting the playback is deliberate: it is what stops the narrator from
+        talking over itself when Kokoro is slower than the generation loop.
+        """
+        await asyncio.to_thread(
+            send_cmd, self.sock_path,
+            {"command": "speak", "text": text, "wait": True},
+            True, 60.0,
+        )
+        print(f"[commentary] {text}", file=sys.stderr)
+
+    async def _approve_command(self, command, purpose):
+        """Human-in-the-loop gate for the CLI tool, from the asyncio thread."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        def ask():
+            approved = self._confirm(
+                "Let the assistant run this command?",
+                f"{command}\n\n{purpose or 'No stated purpose.'}\n\n"
+                "It runs inside a bubblewrap sandbox with no network and a "
+                "read-only filesystem.",
+            )
+            loop.call_soon_threadsafe(future.set_result, bool(approved))
+            return False
+
+        GLib.idle_add(ask)
+        return await future
+
+    # ---------------- orchestrator event renderers ----------------
+    def _note_context(self, info):
+        """Show what the prompt actually cost and whether it had to be cut."""
+        self._ctx_used = info.get("tokens") or 0
+        self._ctx_limit = info.get("limit") or 0
+        self._ctx_window = info.get("n_ctx") or 0
+        self._ctx_info = dict(info)
+        label = style(Gtk.Label(xalign=0.0), "memory-chip")
+        label.set_line_wrap(True)
+        text = (f"[context] prompt {fmt_count(self._ctx_used)}"
+                f" / {fmt_count(self._ctx_limit)} budget"
+                f" / {fmt_count(self._ctx_window)} window")
+        if info.get("steps"):
+            text += "  compressed: " + "; ".join(info["steps"])
+        if info.get("overflowed"):
+            text += "  OVERFLOW"
+        label.set_text(text)
+        self.memory_box.pack_start(label, False, False, 0)
+        if info.get("steps"):
+            self.memory_expander.set_expanded(True)
+        self.memory_box.show_all()
+        self._refresh_title()
+        return False
+
+    def _note_decision(self, decision):
+        label = style(Gtk.Label(xalign=0.0), "memory-chip")
+        label.set_line_wrap(True)
+        label.set_text(f"[router] {decision.summary()}")
+        self.memory_box.pack_start(label, False, False, 0)
+        self.memory_box.show_all()
+        return False
+
+    def _note_tool_start(self, payload):
+        args = payload.get("arguments")
+        if isinstance(args, dict):
+            args = args.get("command") or args.get("query") or json.dumps(args)
+        label = style(Gtk.Label(xalign=0.0), "memory-chip")
+        label.set_line_wrap(True)
+        label.set_text(f"[tool] {payload['name']} <- {str(args)[:160]}")
+        self.memory_box.pack_start(label, False, False, 0)
+        self.memory_expander.set_expanded(True)
+        self.memory_box.show_all()
+        return False
+
+    def _note_tool_result(self, payload):
+        text = payload.get("text") or ""
+        first = next((ln for ln in text.splitlines() if ln.strip()), "")
+        label = style(Gtk.Label(xalign=0.0), "memory-chip")
+        label.set_line_wrap(True)
+        label.set_text(f"[tool] {payload['name']} -> {len(text)} chars  {first[:120]}")
+        self.memory_box.pack_start(label, False, False, 0)
+        self.memory_box.show_all()
+        return False
+
     def _title_worker(self, conversation_id, user_text, answer):
         """Name the thread with the small model; the 35B is busy and overkill."""
         try:
@@ -3668,19 +4188,40 @@ class ChatPopup(Gtk.Window):
             # open never flashes into view. Reasoning models can sit inside one
             # for a long time, so say so rather than showing a frozen "...".
             visible = strip_think(self._stream_raw)
+            if visible and not self._think_collapsed:
+                # The answer has started: fold the reasoning away so it stops
+                # competing with the reply for screen space.
+                self._think_collapsed = True
+                box = getattr(self, "_think_box", None)
+                if box is not None:
+                    box.set_expanded(False)
+                    box.set_label("Thinking  (%s characters)"
+                                  % fmt_count(len(self._stream_reasoning)))
             self._stream_label.set_text(visible or "thinking\u2026")
             if self._stats_label is not None:
                 self._stats_label.set_text(format_stats(self._stats, live=True))
+            self._refresh_usage()
             self._maybe_autoscroll()
         return False
 
     def _note_thinking(self, chars):
-        """Show reasoning progress while no answer text has arrived yet."""
+        """Stream the reasoning into the live panel as it arrives."""
+        box = getattr(self, "_think_box", None)
+        if box is not None and getattr(box, "_body", None) is not None:
+            text = self._stream_reasoning
+            box._body.set_text(text)
+            box.set_label("Thinking\u2026  (%s characters)" % fmt_count(chars)
+                          if not self._think_collapsed
+                          else "Thinking  (%s characters)" % fmt_count(chars))
+            # Follow the newest reasoning rather than sitting at the top.
+            adj = box._scroll.get_vadjustment()
+            adj.set_value(max(0, adj.get_upper() - adj.get_page_size()))
         if self._stream_label is not None and not strip_think(self._stream_raw):
             self._stream_label.set_text("thinking\u2026  (%s characters)" % fmt_count(chars))
-            if self._stats_label is not None:
-                self._stats_label.set_text(format_stats(self._stats, live=True))
-            self._maybe_autoscroll()
+        if self._stats_label is not None:
+            self._stats_label.set_text(format_stats(self._stats, live=True))
+        self._refresh_usage()
+        self._maybe_autoscroll()
         return False
 
     def _show_recalled(self, memories):
@@ -3707,12 +4248,23 @@ class ChatPopup(Gtk.Window):
         return False
 
     def _finish_turn(self, answer, error):
+        if not self.busy:
+            return False          # already finalised (e.g. stop then completion)
         self.busy = False
-        self.send_btn.set_sensitive(self.ai_ready)
+        self._turn = None
+        self._set_send_mode(False)
 
         if error:
+            reasoning = self._stream_reasoning.strip()
             if self._stream_frame is not None:
                 self._fill_markdown(self._stream_frame, answer or "(no response)")
+                if reasoning:
+                    thinking = self._thinking_widget(reasoning)
+                    self._stream_frame.pack_start(thinking, False, False, 0)
+                    self._stream_frame.reorder_child(thinking, 0)
+                    thinking.show_all()
+            self._think_box = None
+            self._think_collapsed = False
             if self._stats_label is not None:
                 self._stats_label.set_text(format_stats(self._stats))
             self._add_notice(error)
@@ -3722,12 +4274,19 @@ class ChatPopup(Gtk.Window):
 
         answer = answer or "(no response)"
         if self._stream_frame is not None:
+            self._stream_frame._raw_text = answer
+            # _fill_markdown clears the frame, so the live reasoning panel is
+            # rebuilt here rather than kept -- same content, now collapsed and
+            # final.
+            reasoning = self._stream_reasoning.strip()
             self._fill_markdown(self._stream_frame, answer)
-            if self._stream_reasoning.strip():
-                thinking = self._thinking_widget(self._stream_reasoning.strip())
+            if reasoning:
+                thinking = self._thinking_widget(reasoning)
                 self._stream_frame.pack_start(thinking, False, False, 0)
                 self._stream_frame.reorder_child(thinking, 0)
                 thinking.show_all()
+        self._think_box = None
+        self._think_collapsed = False
         if self._stats_label is not None:
             self._stats_label.set_text(format_stats(self._stats))
         self.session_tokens += self._stats.get("total", 0)
@@ -4009,6 +4568,14 @@ def main():
     parser.add_argument("--ai-toggle", action="store_true", help="Toggle AI Mode")
     parser.add_argument("--memory-stats", action="store_true", help="Print memory database statistics")
     parser.add_argument("--memory-compact", action="store_true", help="Merge duplicate memories and vacuum")
+    parser.add_argument("--memory-purge-dumps", action="store_true",
+                        help="List undistilled transcript rows polluting recall")
+    parser.add_argument("--memory-purge-impersonal", action="store_true",
+                        help="List stored memories that are general knowledge, not personal")
+    parser.add_argument("--keep", default="",
+                        help="Comma-separated memory ids to spare when purging")
+    parser.add_argument("--yes", action="store_true",
+                        help="With --memory-purge-dumps, actually delete them")
     args = parser.parse_args()
 
     config = load_config()
@@ -4052,6 +4619,34 @@ def main():
 
     if args.memory_stats:
         print(json.dumps(send_cmd(sock_path, {"command": "memory_stats"}), indent=2))
+        return
+
+    if args.memory_purge_impersonal:
+        keep = [int(x) for x in args.keep.replace(",", " ").split() if x.strip().isdigit()]
+        result = send_cmd(sock_path, {"command": "memory_purge_impersonal",
+                                      "dry_run": not args.yes, "keep": keep},
+                          timeout=60.0)
+        for item in result.get("items", []):
+            print(f"  #{item['id']:4}  {item['kind']:10}  {item['preview']!r}")
+        if result.get("dry_run"):
+            print(f"\n{result['found']} impersonal memor"
+                  f"{'y' if result['found'] == 1 else 'ies'} found. "
+                  "Re-run with --yes to delete them.")
+        else:
+            print(f"\nDeleted {result['deleted']} impersonal memor"
+                  f"{'y' if result['deleted'] == 1 else 'ies'}.")
+        return
+
+    if args.memory_purge_dumps:
+        result = send_cmd(sock_path, {"command": "memory_purge_dumps",
+                                      "dry_run": not args.yes}, timeout=60.0)
+        for item in result.get("items", []):
+            print(f"  #{item['id']:4}  {item['chars']:5}ch  {item['preview']!r}")
+        if result.get("dry_run"):
+            print(f"\n{result['found']} raw dump(s) found. "
+                  "Re-run with --yes to delete them.")
+        else:
+            print(f"\nDeleted {result['deleted']} raw dump(s).")
         return
 
     if args.memory_compact:

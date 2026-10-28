@@ -21,7 +21,7 @@ nextcloud_token=your_app_password_token
 // Clicking the waybar "AI" module starts these; clicking again kills them and
 // frees every AI resource (useful before launching a game).
 llama_server_cmd=llama-server --port 9090 --parallel 1 -c 4096 -ngl 10 --image-min-tokens 1024 -m /path/to/vision-model.gguf --mmproj /path/to/mmproj-BF16.gguf
-llama_small_server_cmd=llama-server --port 9191 -hf Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q8_0 -c 1024 --parallel 1 -ngl 99
+llama_small_server_cmd=llama-server --port 9191 -hf Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q8_0 -c 8192 --parallel 2 -ngl 99 --no-warmup
 llama_health_url=http://127.0.0.1:9090/health
 llama_small_health_url=http://127.0.0.1:9191/health
 ai_mode_state_file=~/.local/share/ai_assistant/ai_mode.json
@@ -35,6 +35,64 @@ tray_poll_seconds=3
 hotkey_chat=ctrl+alt+a
 hotkey_capture=ctrl+alt+s
 hotkey_ai_toggle=ctrl+alt+shift+a
+
+// ---------------------------------------------------------------------------
+// Context budget & compression
+//   The prompt is measured exactly (/apply-template + /tokenize) before every
+//   request. Over the trigger it is compressed in order of cheapest loss:
+//   trim tool output -> fold old turns into a rolling summary -> drop the
+//   weakest recalled memories -> shed turns. The folded summary is persisted
+//   with a watermark, so a long thread pays the summarisation cost once.
+// ---------------------------------------------------------------------------
+context_reserve_completion=4096
+context_safety_margin=256
+context_compress_at=0.9
+context_history_turns=12
+context_keep_recent_turns=4
+context_min_memories=2
+context_tool_share=0.5
+// large = the 35B writes the summary (better, slower); small = the 0.5B
+context_summary_model=large
+
+// ---------------------------------------------------------------------------
+// Decision router -- the small model classifies every prompt with constrained
+// decoding (llama.cpp GBNF) before any text is generated.
+// ---------------------------------------------------------------------------
+router_enabled=1
+router_debug=0
+
+// Live commentary: the small model narrates while the big model works, spoken
+// through Kokoro so there is no silent wait.
+commentary_enabled=1
+// Speak during text chat too. Off: the voice is reserved for background
+// work (screenshot analysis, note sync, sessions) that you are not watching.
+commentary_in_chat=0
+commentary_interval=9
+commentary_max_lines=6
+
+// Web search tool. Leave searx_url empty to use DuckDuckGo's HTML endpoint.
+web_search_searx_url=
+web_search_timeout=12
+web_search_fetch_pages=1
+web_search_page_chars=2500
+
+// Command-line tool. Commands run under bubblewrap (Linux only); without it
+// nothing runs unless cli_allow_unsandboxed=1.
+//   cli_policy:  deny | ask | allow   (ask = read-only runs, rest confirms)
+//   cli_fs_mode: ro-root | minimal    (ro-root = whole fs read-only + masks)
+cli_policy=ask
+cli_fs_mode=ro-root
+cli_timeout=20
+cli_output_limit=8000
+cli_allow_shell=0
+cli_allow_network=0
+cli_allow_unsandboxed=0
+cli_workspace=~/.local/share/ai_assistant/sandbox
+cli_readable_paths=~/Programming
+//cli_mask_paths=~/.ssh:~/.gnupg:/etc/shadow     (empty = built-in list)
+//cli_extra_allow=cargo:npm
+//cli_extra_auto_ok=git
+//cli_ai_user=aiuser        only used when the daemon itself runs as root
 
 // Small narrator model (used for spoken status updates)
 llama_small_url=http://127.0.0.1:9191/v1/chat/completions

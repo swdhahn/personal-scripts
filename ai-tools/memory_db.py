@@ -20,7 +20,7 @@ import zlib
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 KINDS = ("fact", "preference", "project", "event", "summary")
 SOURCES = ("chat", "screenshot", "manual")
@@ -28,6 +28,10 @@ SOURCES = ("chat", "screenshot", "manual")
 DEFAULT_COMPRESS_THRESHOLD = 2048
 DEFAULT_HALF_LIFE_DAYS = 30.0
 DEFAULT_TOP_K = 6
+# Fraction of the query's content words a memory must share to be considered
+# relevant at all. One word out of three ("write") is noise, not a match.
+DEFAULT_MIN_COVERAGE = 0.5
+DEFAULT_MIN_SCORE = 0.05
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -42,7 +46,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at    TEXT NOT NULL,
     summary       TEXT,
     message_count INTEGER NOT NULL DEFAULT 0,
-    archived      INTEGER NOT NULL DEFAULT 0
+    archived      INTEGER NOT NULL DEFAULT 0,
+    -- Highest messages.id already folded into `summary`. Turns at or below it
+    -- are represented by the summary and are not replayed verbatim, so the
+    -- cost of compacting a long thread is paid once instead of every turn.
+    summary_through_id INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -94,6 +102,11 @@ _STOPWORDS = {
     "our", "he", "she", "they", "them", "what", "which", "who", "how", "when",
     "where", "why", "can", "could", "would", "should", "will", "shall", "may",
     "have", "has", "had", "not", "no", "yes", "there", "here", "about", "from",
+    # The distiller writes every memory in the third person ("The user prefers
+    # ..."), so "user" and "assistant" appear in almost all of them and carry
+    # no discriminating signal -- they only let unrelated rows clear the
+    # coverage gate.
+    "user", "assistant", "please", "tell", "say", "write", "give", "make",
 }
 
 
@@ -143,18 +156,39 @@ def _normalize_text(text):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())).strip()
 
 
+def _stem(token):
+    """Deliberately minimal: fold plural / third-person -s only.
+
+    Enough to make "live"/"lives" and "own"/"owns" compare equal, which is what
+    coverage needs, without the false conflations a full Porter stemmer brings
+    to a corpus this small. Applied to both sides, so it only has to be
+    consistent, not linguistically correct.
+    """
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
 def _tokens(text):
-    return {t for t in _normalize_text(text).split() if len(t) > 1 and t not in _STOPWORDS}
+    return {_stem(t) for t in _normalize_text(text).split()
+            if len(t) > 1 and t not in _STOPWORDS}
 
 
 def fts_query(text, limit=32):
-    """Turn free-form text into a safe FTS5 OR-query (operators stripped)."""
+    """Turn free-form text into a safe FTS5 OR-query (operators stripped).
+
+    Terms of four characters or more are emitted as stemmed prefix matches, so
+    "live" also finds "lives" and "lived". The FTS index itself has no stemmer,
+    and without this a query could miss the one memory that answers it purely
+    on a plural. Short tokens stay exact, where a prefix would over-match.
+    """
     seen, out = set(), []
     for tok in re.findall(r"[A-Za-z0-9_]+", (text or "").lower()):
         if len(tok) < 2 or tok in _STOPWORDS or tok in seen:
             continue
         seen.add(tok)
-        out.append('"%s"' % tok)
+        stem = _stem(tok)
+        out.append('"%s"*' % stem if len(stem) >= 4 else '"%s"' % stem)
         if len(out) >= limit:
             break
     return " OR ".join(out)
@@ -183,6 +217,7 @@ def open_db(path, check_same_thread=True):
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -190,6 +225,21 @@ def open_db(path, check_same_thread=True):
     )
     conn.commit()
     return conn
+
+
+def _migrate(conn):
+    """Bring an existing database up to SCHEMA_VERSION.
+
+    _SCHEMA only uses CREATE TABLE IF NOT EXISTS, so columns added to a table
+    that already exists need an explicit ALTER. Each step is idempotent and
+    guarded by the column actually being absent, so running against a fresh
+    database (where _SCHEMA already created it) is a no-op.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+    if "summary_through_id" not in existing:
+        conn.execute("ALTER TABLE conversations "
+                     "ADD COLUMN summary_through_id INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +263,24 @@ def rename_conversation(conn, conversation_id, title):
     conn.commit()
 
 
-def set_summary(conn, conversation_id, summary):
+def set_summary(conn, conversation_id, summary, through_id=None):
+    """Store a conversation summary.
+
+    `through_id` records the highest message id the summary covers; pass it
+    when the summary was produced by folding specific turns away, so they are
+    not replayed alongside it. Omit it to leave the watermark untouched.
+    """
+    if through_id is not None:
+        conn.execute(
+            "UPDATE conversations SET summary=?, summary_through_id=?, updated_at=? WHERE id=?",
+            (summary, int(through_id), _now(), conversation_id),
+        )
+        conn.commit()
+        return
+    return _set_summary_only(conn, conversation_id, summary)
+
+
+def _set_summary_only(conn, conversation_id, summary):
     conn.execute(
         "UPDATE conversations SET summary=?, updated_at=? WHERE id=?",
         (summary, _now(), conversation_id),
@@ -255,9 +322,14 @@ def _decode(row):
     return value if isinstance(value, str) else bytes(value).decode("utf-8", "replace")
 
 
-def get_messages(conn, conversation_id, limit=None):
-    sql = "SELECT * FROM messages WHERE conversation_id=? ORDER BY id"
-    rows = conn.execute(sql, (conversation_id,)).fetchall()
+def get_messages(conn, conversation_id, limit=None, after_id=0):
+    """Turns of a conversation, oldest first.
+
+    `after_id` skips everything already folded into the summary; `limit` then
+    keeps the most recent N of what remains.
+    """
+    sql = "SELECT * FROM messages WHERE conversation_id=? AND id>? ORDER BY id"
+    rows = conn.execute(sql, (conversation_id, int(after_id or 0))).fetchall()
     if limit:
         rows = rows[-limit:]
     return [
@@ -512,6 +584,20 @@ def top_tags(conn, limit=20):
     ]
 
 
+def _coverage(query_terms, content):
+    """Fraction of the query's distinct content words present in `content`.
+
+    Both sides are stemmed by _tokens(), so "where does the user live" covers
+    "The user lives in Orange, CA" fully rather than at one half.
+    """
+    if not query_terms:
+        return 1.0
+    body = _tokens(content)
+    if not body:
+        return 0.0
+    return len(set(query_terms) & body) / len(set(query_terms))
+
+
 def _row_to_memory(conn, row, score=None):
     item = {
         "id": row["id"],
@@ -530,11 +616,23 @@ def _row_to_memory(conn, row, score=None):
 
 
 def search(conn, query, k=DEFAULT_TOP_K, min_importance=0.0,
-           half_life_days=DEFAULT_HALF_LIFE_DAYS, tags=None, touch=True):
-    """Rank live memories by relevance x importance x recency x familiarity.
+           half_life_days=DEFAULT_HALF_LIFE_DAYS, tags=None, touch=True,
+           min_coverage=DEFAULT_MIN_COVERAGE, min_score=DEFAULT_MIN_SCORE,
+           allow_fallback=False):
+    """Rank live memories by relevance x coverage x importance x recency.
 
-    Falls back to importance/recency ordering when the query yields no usable
-    search tokens (e.g. "hi" or pure punctuation).
+    The FTS query is an OR of the query's terms, so a single shared common word
+    is enough to produce a match: asking "can you write me a dangerous story"
+    retrieved a note beginning "Please write a narrative..." purely on "write",
+    and the answer was then built around that unrelated note. `min_coverage`
+    is the guard -- a candidate must share a real fraction of the query's
+    terms, not just one of them -- and `min_score` drops weak matches outright.
+
+    `allow_fallback` re-enables the old behaviour of returning the most
+    important recent memories when nothing matches at all. That is useful when
+    the caller already knows the user is asking about the past ("what did we
+    talk about yesterday"), and actively harmful otherwise, so it is off by
+    default rather than on.
     """
     k = max(1, int(k))
     pool = max(40, k * 8)
@@ -555,29 +653,51 @@ def search(conn, query, k=DEFAULT_TOP_K, min_importance=0.0,
     else:
         rows = []
 
-    if not rows:
+    if not rows and (allow_fallback or not match):
+        # Nothing matched. Either the query had no usable terms at all ("hi"),
+        # or the caller explicitly wants the most salient recent memories.
         rows = conn.execute(
             "SELECT *, 0.0 AS bm FROM memories WHERE superseded_by IS NULL AND importance >= ? "
             "ORDER BY importance DESC, created_at DESC LIMIT ?",
             (min_importance, pool),
         ).fetchall()
+        # These rows were chosen by salience, not by matching, so a term
+        # coverage test on them would reject every one and leave the caller
+        # with nothing at all -- which is the opposite of what asking for a
+        # fallback meant.
+        min_coverage, min_score = 0.0, 0.0
 
     half_life = max(0.5, float(half_life_days))
+    query_terms = _tokens(query)
     scored = []
     for row in rows:
         # bm25() is negative, more negative = better; map into (0, 1).
         relevance = max(0.0, -float(row["bm"]))
-        rel = relevance / (1.0 + relevance) if relevance else 0.15
+        # bm25() collapses to ~0 for a term that appears in nearly every row
+        # ("user" here), which drove the score of perfectly good memories to
+        # zero. A match is always worth at least the baseline; letting
+        # coverage do the discriminating is far more reliable than bm25 on a
+        # corpus of a few dozen short rows.
+        rel = max(0.15, relevance / (1.0 + relevance))
         weight = 0.5 + 0.5 * _clamp(row["importance"])
         recency = math.exp(-_age_days(row["created_at"]) / half_life)
         familiarity = 1.0 + 0.1 * math.log1p(max(0, row["access_count"]))
-        scored.append((rel * weight * recency * familiarity, row))
+        coverage = _coverage(query_terms, row["content"])
+        # Coverage multiplies rather than only gating, so a memory that matches
+        # every term still outranks one that clips a single word.
+        scored.append((rel * weight * recency * familiarity * (0.25 + 0.75 * coverage),
+                       coverage, row))
 
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+    scored.sort(key=lambda triple: triple[0], reverse=True)
 
     results = []
-    for score, row in scored:
+    for score, coverage, row in scored:
+        if query_terms and coverage < min_coverage:
+            continue
+        if score < min_score:
+            continue
         item = _row_to_memory(conn, row, score)
+        item["coverage"] = round(coverage, 3)
         if tag_filter and not set(tag_filter) & set(item["tags"]):
             continue
         results.append(item)
@@ -612,6 +732,107 @@ def format_for_prompt(memories):
 # ---------------------------------------------------------------------------
 # maintenance
 # ---------------------------------------------------------------------------
+# A memory is worth keeping only if it is about this person. The distiller
+# writes in the third person ("The user ..."), so a reference to the user or to
+# something of theirs is the signal; general knowledge has none.
+_PERSONAL_RE = re.compile(
+    r"\b(user|users|user's|their|theirs|they|them|he|she|his|her|your|yours|you|"
+    r"my|mine|i|we|our|system|machine|laptop|desktop|workstation|host|rig|"
+    r"repo|repository|setup|config|configuration)\b", re.I)
+
+# Local-setup wording counts as personal even with no pronoun in the sentence:
+# "The waybar signal number is configured to 8" is a fact about this machine,
+# not about the world.
+_SETUP_RE = re.compile(
+    r"\b(configured|configure|installed|enabled|disabled|set to|default[s]? to|"
+    r"port|path|directory|folder|keybind|shortcut|alias|script|daemon|service|"
+    r"server|venv|dotfile[s]?|theme|font|wallpaper|hotkey)\b", re.I)
+
+# Things that are never durable regardless of phrasing: the clock, the calendar
+# and anything explicitly framed as current.
+_EPHEMERAL_RE = re.compile(
+    r"\b(today is|tomorrow is|yesterday was|current (date|time|year|version|price)|"
+    r"it is \d{1,2}:\d{2}|this (morning|afternoon|evening)|right now,|"
+    r"as of (today|now)|national .{3,30} day)\b", re.I)
+
+
+def is_personal(content, kind=None):
+    """True when a memory is about the user rather than about the world.
+
+    The distillation prompt asks for this, but a prompt is a request, not a
+    guarantee -- the store had filled up with rifle calibres, the mercury
+    content of dolphin meat and what day it was. This is the part that holds.
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    if _EPHEMERAL_RE.search(text):
+        return False
+    return bool(_PERSONAL_RE.search(text) or _SETUP_RE.search(text))
+
+
+def find_impersonal(conn):
+    """Stored memories that are general knowledge rather than about the user."""
+    rows = conn.execute(
+        "SELECT * FROM memories WHERE superseded_by IS NULL ORDER BY id").fetchall()
+    return [_row_to_memory(conn, r) for r in rows
+            if not is_personal(r["content"], r["kind"])]
+
+
+def purge_impersonal(conn, dry_run=True, keep=()):
+    """`keep` spares specific ids.
+
+    The rule cannot tell "The coolant tank on the Boxster has been replaced"
+    (the user's car, no pronoun in the sentence) from a specification anyone
+    could look up, so the decision on the edge cases stays with the user.
+    """
+    keep = {int(k) for k in (keep or ())}
+    found = [i for i in find_impersonal(conn) if i["id"] not in keep]
+    if not dry_run:
+        for item in found:
+            delete_memory(conn, item["id"])
+    return {
+        "found": len(found), "deleted": 0 if dry_run else len(found),
+        "dry_run": bool(dry_run),
+        "items": [{"id": i["id"], "kind": i["kind"], "preview": i["content"][:100]}
+                  for i in found],
+    }
+
+
+def find_raw_dumps(conn, min_chars=400):
+    """Undistilled transcript rows written by the old failed-distillation path.
+
+    These are verbatim copies of turns that are still in the messages table, so
+    they add no durability -- but they are 20x the size of a real memory and
+    match on any common word, which is how an unrelated note ended up steering
+    a story prompt. Identified by the tag the fallback stamped on them.
+    """
+    rows = conn.execute(
+        "SELECT m.* FROM memories m "
+        "JOIN memory_tags mt ON mt.memory_id = m.id "
+        "JOIN tags t ON t.id = mt.tag_id "
+        "WHERE t.name = 'unparsed' AND m.superseded_by IS NULL "
+        "AND length(m.content) >= ? ORDER BY m.id",
+        (int(min_chars),),
+    ).fetchall()
+    return [_row_to_memory(conn, row) for row in rows]
+
+
+def purge_raw_dumps(conn, min_chars=400, dry_run=True):
+    """Report (and optionally delete) the rows find_raw_dumps() identifies."""
+    found = find_raw_dumps(conn, min_chars=min_chars)
+    if not dry_run:
+        for item in found:
+            delete_memory(conn, item["id"])
+    return {
+        "found": len(found),
+        "deleted": 0 if dry_run else len(found),
+        "dry_run": bool(dry_run),
+        "items": [{"id": i["id"], "chars": len(i["content"]),
+                   "preview": i["content"][:90]} for i in found],
+    }
+
+
 def compact(conn, similarity=0.85, min_tokens=4):
     """Collapse duplicate/near-duplicate memories onto the newest survivor.
 
